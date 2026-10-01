@@ -32,9 +32,39 @@ ip maddr show dev wlan0      # while the probe runs: the announced data group
                              # (224.0.0.1 is always listed, so it proves nothing)
 ```
 
-Make sure the LAN subnet does not overlap the Wi-Fish subnet. If both the LAN
-and the Wi-Fish use `192.x` addresses, the probe picks the one on the same
-subnet as the announced device; pass `--iface <WLAN address>` to force it.
+## When the LAN overlaps the sonar subnet
+
+The sonar hands out `192.168.0.x` addresses, the most common home and router
+subnet. If your LAN uses the same range, joining the sonar Wi-Fi gives the
+host a direct route for `192.168.0.0/24` through the WLAN. Packets from a LAN
+client (SSH, the Signal K web UI) still arrive over Ethernet, but the replies
+go out to the sonar network and are lost, so the host seems to drop off the
+LAN whenever the sonar is on.
+
+Check the LAN client's address. If it starts with `192.168.0.`, this is the
+cause. The fix is to limit the WLAN route to the sonar itself instead of the
+whole /24: give the WLAN a static `/32` address and add a host route to the
+sonar (`192.168.0.1`) only:
+
+```sh
+nmcli con mod wifish \
+  ipv4.method manual \
+  ipv4.addresses 192.168.0.141/32 \
+  ipv4.routes "192.168.0.1/32" \
+  ipv4.never-default yes
+nmcli con up wifish
+```
+
+Pick any unused address in the sonar's range for the WLAN; `192.168.0.141` is
+an example. Multicast discovery still works, since `224.0.0.1` is link-local
+and does not depend on the subnet route. Set the plugin's **Wi-Fi interface
+address** (or the probe's `--iface`) to that WLAN address, because with both
+networks on `192.168.0.x` the automatic pick can land on the Ethernet side.
+
+If the LAN uses a different range, no special routing is needed. Both
+interfaces may still have `192.x` addresses; the probe then picks the one on
+the same subnet as the announced device, and `--iface <WLAN address>` forces
+it.
 
 ## Docker
 
