@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # Keeps the pinned signalk-server plugin-ci workflow (and any actions) current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

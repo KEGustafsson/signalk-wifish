@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#242328">
+  <title>Wi-Fish Sonar</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div id="app">
+    <header class="actionbar">
+      <button id="btn-settings" class="icon-btn round" title="Sonar settings" aria-label="Sonar settings" hidden></button>
+      <button id="btn-views" class="icon-btn round" title="Switch view" aria-label="Switch view"></button>
+      <button id="btn-pause" class="icon-btn round" title="Pause" aria-label="Pause"></button>
+      <button id="btn-snapshot" class="icon-btn round" title="Snapshot" aria-label="Snapshot"></button>
+      <span class="spacer"></span>
+      <span id="link-state" class="link-state" aria-live="polite"></span>
+      <button id="btn-more" class="icon-btn round" title="More" aria-label="More"></button>
+    </header>
+    <main id="screen">
+      <div id="traces" class="traces split"></div>
+      <div id="history-scroll" class="history-scroll" hidden><div class="thumb"></div></div>
+      <button id="btn-ff" class="icon-btn ff" title="Back to live" aria-label="Back to live" hidden></button>
+      <div id="sim-blink" class="sim-blink" hidden>Simulated data</div>
+      <div id="databox" class="databox">
+        <div class="env"><span id="depth" class="main">--</span><span id="depth-frac" class="frac">-</span><span id="depth-unit" class="unit">m</span></div>
+        <div class="env"><span id="temp" class="main">--</span><span id="temp-frac" class="frac">-</span><span id="temp-unit" class="unit">--</span></div>
+      </div>
+      <div id="flash" class="flash" hidden></div>
+    </main>
+    <section id="connecting" class="connecting">
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 120 60"><g fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"><path d="M45 12c9-6 21-6 30 0M50 20c6-4 14-4 20 0"/><path d="M28 42c10-12 32-13 46 0-14 13-36 12-46 0z"/><path d="M74 42l14-9v18z"/></g></svg>
+        <div class="wordmark">Wi-Fish <span>Sonar</span></div>
+      </div>
+      <div id="offline" class="offline" hidden>
+        <h1>Sonar offline</h1>
+        <p id="offline-hint">To view sonar, join this Signal K server to a Wi-Fish or Dragonfly Pro Wi-Fi access point.</p>
+        <button id="btn-retry" class="connect-btn">Retry</button>
+      </div>
+      <p id="connect-msg" class="connect-msg"></p>
+    </section>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
