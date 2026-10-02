@@ -16,8 +16,8 @@ device connected to your Signal K server:
 **Status:** working on real hardware. The protocol was derived from static analysis of the
 Android app and then validated against a unit: Wi-Fi discovery and session keepalive, CHIRP
 sonar and DownVision echograms, depth and water temperature, settings changes and the
-transducer offset all behave as the Android app does. A built-in demo sonar lets you try
-everything without a unit.
+transducer offset all behave as the Android app does. Two clients can watch the same unit
+at once. A built-in demo sonar lets you try everything without a unit.
 
 ## How it works
 
@@ -125,10 +125,16 @@ node tools/dump-raw.mjs raw.bin --id 0x270104 --hex
 
 - [x] Validate on hardware: connection, sonar data, settings and depth/temperature output
 - [x] Confirm the transducer offset convention (depth reference)
-- [ ] Resolve the remaining ❓ fields in the protocol doc (unused by the app, cosmetic)
+- [x] Resolve the ❓ fields in the protocol doc, as far as a Wi-Fish shows them
+  ([docs/PROTOCOL.md §8](docs/PROTOCOL.md)): supply voltage, firmware version,
+  device serial, bottom-record channel, the four message types the app ignores
+  and the settings limits. What is left needs a Dragonfly (CHIRP channel,
+  multi-segment ping columns); how it affects decoding and display is still untested
 - [x] Signal K server plugin (TypeScript, vitest)
 - [x] Echogram stream and web UI
-- [ ] Waypoints (the app syncs them from the Dragonfly over TCP) as Signal K resources
+- [ ] Waypoints (the app syncs them from the Dragonfly over TCP) as Signal K
+  resources — needs a Dragonfly: a Wi-Fish announces only the sonar service, no
+  waypoint service, since it has no GPS or waypoint store
 
 ## Legal
 
