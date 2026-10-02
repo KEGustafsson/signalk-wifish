@@ -12,9 +12,10 @@ import { performance } from 'node:perf_hooks';
 import {
   VERSION, DISCOVERY, SERVICE_SONAR, MsgId, REQUIRED,
   messageId, parseHeader, isWellFormed, parseAnnounce, checkService, parseUnit,
-  parseBottom, parseEnv, parseError, parsePingResults, parsePingData, buildKeepalive, PingAssembler,
+  parseBottom, parseEnv, parseError, parsePingResults, parsePingData, parseSystemSettings,
+  buildKeepalive, PingAssembler,
 } from '../dist/sonar4.js';
-import { PATH, cmToM, centiCToK, toDelta, Throttle } from '../dist/signalk.js';
+import { PATH, centiCToK, depthValues, toDelta, Throttle } from '../dist/signalk.js';
 import { CHANNEL, encodeRecord, readRawLog } from '../dist/rawlog.js';
 
 const USAGE = `Usage: wifish-probe [options]
@@ -70,11 +71,31 @@ function logRaw(channel, buf) {
 const skSock = opts.sk ? dgram.createSocket('udp4') : null;
 skSock?.on('error', (e) => console.warn(`[sk] ${e.message}`));
 // Depth: on change, max 5 Hz, 5 s heartbeat. Temperature: max 1 Hz, 10 s heartbeat. null (no data) passes at once.
-const throttles = { [PATH.depth]: new Throttle({ minIntervalMs: 200, heartbeatMs: 5000 }), [PATH.waterTemp]: new Throttle({ minIntervalMs: 1000, heartbeatMs: 10_000 }) };
+const depthThrottle = new Throttle({ minIntervalMs: 200, heartbeatMs: 5000 });
+const tempThrottle = new Throttle({ minIntervalMs: 1000, heartbeatMs: 10_000 });
+/** Both depth paths share the depth throttle; a Throttle keeps its last value per path. */
+const throttleFor = (p) => (p === PATH.waterTemp ? tempThrottle : depthThrottle);
 function emitSk(p, value) {
-  if (!skSock || !throttles[p].shouldEmit(p, value, mono())) return;
+  if (!skSock || !throttleFor(p).shouldEmit(p, value, mono())) return;
   // One delta per datagram: the Signal K UDP input JSON.parses each datagram whole.
   skSock.send(JSON.stringify(toDelta([{ path: p, value }])), opts.sk.port, opts.sk.host, (e) => e && console.warn(`[sk] ${e.message}`));
+}
+
+/**
+ * Transducer offset the device applies to the depth it reports (system settings
+ * off 60, PROTOCOL.md §6); needed to name the depth paths correctly.
+ */
+let transducerOffsetCm = 0;
+/** Depth paths published so far, so one that stops applying can be cleared. */
+let depthPaths = new Set();
+/** Depth on the paths the offset makes it mean: belowTransducer, plus belowSurface / belowKeel. */
+function emitDepth(cm) {
+  const values = depthValues(cm, transducerOffsetCm);
+  const now = new Set(values.map((v) => v.path));
+  // The offset changed sign (or went to 0): a path that no longer applies would keep its last value.
+  for (const p of depthPaths) if (!now.has(p)) emitSk(p, null);
+  depthPaths = now;
+  for (const v of values) emitSk(v.path, v.value);
 }
 
 // ---------- sonar4 decode ----------
@@ -106,8 +127,9 @@ function handleSonar(b, via) {
     case MsgId.BOTTOM: {
       const m = parseBottom(b);
       console.log(`[depth] ${m.depthCm === null ? '--' : (m.depthCm / 100).toFixed(2) + ' m'}  q=${m.quality} ch=${m.channel}`);
-      // ❓ Assumed below-transducer; unconfirmed (PROTOCOL.md §5). null = bottom lock lost, clears stale depth.
-      emitSk(PATH.depth, m.depthCm === null ? null : cmToM(m.depthCm));
+      // The device reports depth with its transducer offset already applied (PROTOCOL.md §5),
+      // so the paths follow that offset. null = bottom lock lost, clears stale depth.
+      emitDepth(m.depthCm);
       break;
     }
     case MsgId.ENV: {
@@ -119,6 +141,15 @@ function handleSonar(b, via) {
     case MsgId.ERROR:
       console.log(`[error] flags=0x${parseError(b).flags.toString(16)}`);
       break;
+    case MsgId.SYS_SETTINGS: {
+      const s = parseSystemSettings(b);
+      if (s && s.transducerOffsetCm !== transducerOffsetCm) {
+        transducerOffsetCm = s.transducerOffsetCm;
+        console.log(`[settings] transducer offset ${transducerOffsetCm} cm, depth unit ${s.depthUnit}, simulator ${s.simulator}`);
+        emitDepth(null); // retire the paths the old offset implied; the next bottom record refills them
+      }
+      break;
+    }
     // A column completes on whichever of its data and results arrives last.
     case MsgId.PING_RESULTS:
       logColumn(asm.addResults(parsePingResults(b), mono()));
@@ -220,7 +251,7 @@ function watchdog() {
   const quiet = mono() - lastRx > 5000;
   if (quiet && !stale) {
     console.warn('[watchdog] no sonar data for 5 s');
-    emitSk(PATH.depth, null);
+    emitDepth(null);
   } else if (!quiet && stale) {
     console.log('[watchdog] data flowing again');
   }

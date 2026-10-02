@@ -2,6 +2,20 @@
 
 ## 0.1.0
 
+- `tools/wifish-probe.mjs --sk` published the depth the unit reports as
+  `environment.depth.belowTransducer`, which is only right when the transducer
+  offset is 0. It now reads the offset from the unit's system settings and uses the
+  same paths as the plugin (`belowKeel` / `belowSurface` for a non-zero offset),
+  clearing a path that stops applying when the offset changes.
+- Protocol notes: the ❓ fields a Wi-Fish shows are resolved from captures of a real
+  unit (firmware 13.31) and marked 📡 — supply voltage and its low/high marks in the
+  environment message (cross-checked against the boat's battery monitor), the device
+  serial in every message header, the firmware version in the discovery message, the
+  channel in the bottom record, the copy of the channel settings each ping result
+  carries, the discovery service name, and the four message types the app ignores
+  (transducer descriptor, settings limits, preset table, recorder status). A second
+  client is confirmed to work alongside the plugin. What is still open needs a
+  Dragonfly and is listed in PROTOCOL.md §7.
 - Validated on hardware: Wi-Fi discovery and session keepalive, CHIRP sonar and
   DownVision echograms, depth and water temperature, settings changes and the
   transducer offset convention all confirmed against a real unit.
