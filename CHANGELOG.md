@@ -15,6 +15,13 @@
   Wi-Fi, keeps the session alive and publishes `environment.depth.belowTransducer`
   (plus `belowSurface` / `belowKeel` when a transducer offset is set) and
   `environment.water.temperature`.
+- Depth below surface and below keel together: the unit holds one transducer offset,
+  to the waterline or to the keel. With it set to the keel (or 0), *Settings →
+  Waterline to transducer* in the web app gives the distance the unit lacks, and the
+  plugin publishes `environment.depth.belowSurface` from it. The offsets are published
+  as `surfaceToTransducer` and `transducerToKeel` (positive downwards, as Signal K and
+  the derived-data plugin use them). The distance is kept in the plugin's data
+  directory (`vessel.json`) and shared by every viewer.
 - "Wi-Fish Sonar" web app with the Android app's sonar screen: scrolling CHIRP sonar
   and DownVision echograms (split or single), depth ruler, depth and water
   temperature readout, pause and history scrolling, pinch/wheel zoom with zoom box,

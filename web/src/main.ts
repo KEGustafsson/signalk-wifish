@@ -2,7 +2,7 @@
 
 import { ColumnStore } from './history';
 import { TraceView } from './trace';
-import { PluginStream, setChannel, setDisplay, setSystem } from './stream';
+import { PluginStream, setChannel, setDisplay, setSystem, setVessel } from './stream';
 import { prefs, savePrefs, storedKeys, type Prefs, type ViewConfig } from './prefs';
 import { ICONS } from './icons';
 import {
@@ -10,7 +10,7 @@ import {
   type Ctx, type DialogHandle,
 } from './dialogs';
 import { formatDepth, formatTemp, snapToPreset, unitByCode, unitById, type DepthUnit } from '../../src/shared/units';
-import type { ChannelName, DisplayPrefs, WifishState } from '../../src/shared/api';
+import type { ChannelName, DisplayPrefs, VesselSettings, WifishState } from '../../src/shared/api';
 
 declare const __VERSION__: string;
 
@@ -20,6 +20,8 @@ const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as 
 // ------------------------------------------------------------------ model
 
 let state: WifishState | null = null;
+/** Vessel settings kept by the plugin (waterline-to-transducer distance). */
+let vessel: VesselSettings = {};
 const listeners = new Set<(s: WifishState | null) => void>();
 const stores: Record<ChannelName, ColumnStore> = {
   sonar: new ColumnStore('sonar'),
@@ -592,6 +594,11 @@ const ctx: Ctx = {
     useUnits(patch);
     setDisplay(patch).catch((e) => toast(`Units not saved on the server: ${(e as Error).message}`));
   },
+  vessel: () => vessel,
+  /** Save vessel settings on the plugin; every viewer gets them back as a "vessel" event. */
+  setVessel(patch) {
+    setVessel(patch).then(onVessel, (e) => toast(`Not saved: ${(e as Error).message}`));
+  },
   /** Subscribe to state changes; returns an unsubscribe function. */
   onState(cb) { listeners.add(cb); return () => listeners.delete(cb); },
 };
@@ -617,6 +624,12 @@ function onDisplay(d: DisplayPrefs): void {
   if (d.depthUnit === undefined && storedKeys.has('depthUnit')) offer.depthUnit = prefs.depthUnit;
   if (d.tempUnit === undefined && storedKeys.has('tempUnit')) offer.tempUnit = prefs.tempUnit;
   if (Object.keys(offer).length) setDisplay(offer).catch(() => { /* kept in this browser */ });
+}
+
+/** Take the vessel settings the plugin keeps and tell open dialogs. */
+function onVessel(v: VesselSettings): void {
+  vessel = v;
+  for (const l of listeners) l(state);
 }
 
 /** Clear the stores and return the traces to live and unzoomed. */
@@ -645,6 +658,7 @@ function toast(msg: string): void {
 const stream = new PluginStream({
   state: onState,
   display: onDisplay,
+  vessel: onVessel,
   /** Store an incoming ping column and redraw its trace if it is live or zoomed. */
   column(c) {
     stores[c.ch].add(c);

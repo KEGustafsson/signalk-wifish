@@ -4,7 +4,7 @@
 import { Engine } from './engine';
 import path from 'node:path';
 import { Api } from './api';
-import { DisplayStore } from './display';
+import { DisplayStore, VesselStore } from './store';
 import { DeviceTransport } from './device';
 import { DemoDevice } from './demo';
 import { ReplayTransport } from './replay';
@@ -103,12 +103,15 @@ export function plugin(app: ServerApp) {
   let engine: Engine | null = null;
   /** Log through the server's debug logger, if it has one. */
   const debug = (m: string) => app.debug?.(m);
-  /** The web app's display units, saved in the plugin's data directory. */
-  const display = new DisplayStore(() => {
+  /** A file in the plugin's data directory, or undefined before the server provides one. */
+  const dataFile = (name: string) => () => {
     const dir = app.getDataDirPath?.();
-    return dir ? path.join(dir, 'display.json') : undefined;
-  }, debug);
-  const api = new Api(() => engine, display);
+    return dir ? path.join(dir, name) : undefined;
+  };
+  /** The web app's display units and the vessel settings, saved in the plugin's data directory. */
+  const display = new DisplayStore(dataFile('display.json'), debug);
+  const vessel = new VesselStore(dataFile('vessel.json'), debug);
+  const api = new Api(() => engine, display, vessel);
 
   /** Show link changes as plugin status; 'offline' (other than after stop) as a plugin error. */
   const status = (link: string, msg: string) => {
@@ -135,6 +138,7 @@ export function plugin(app: ServerApp) {
           historyColumns: cfg.historyColumns,
           emitDepth: cfg.emitDepth,
           emitTemperature: cfg.emitTemperature,
+          surfaceToTransducerCm: () => vessel.get().surfaceToTransducerCm ?? null,
           onDelta: (d) => app.handleMessage(PLUGIN_ID, d),
           log: debug,
         });

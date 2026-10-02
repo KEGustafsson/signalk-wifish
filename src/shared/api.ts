@@ -55,6 +55,16 @@ export interface DisplayPrefs {
   tempUnit?: 'C' | 'F';
 }
 
+/**
+ * Vessel settings the sonar does not hold, kept by the plugin like the display units.
+ * The sonar stores one transducer offset, to the waterline or to the keel; when it is set
+ * to the keel (or not set), this distance lets the plugin publish depth below surface too.
+ */
+export interface VesselSettings {
+  /** Waterline to transducer, cm (0..300); null or missing = not set. */
+  surfaceToTransducerCm?: number | null;
+}
+
 /** One echogram column, sent as SSE event "col". */
 export interface ColumnMessage {
   ch: ChannelName;

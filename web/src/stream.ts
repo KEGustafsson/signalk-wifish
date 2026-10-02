@@ -1,10 +1,14 @@
 // Connection to the plugin: SSE for state and columns, fetch for settings.
 
-import { API_BASE, type ChannelName, type ChannelPatch, type ColumnMessage, type DisplayPrefs, type SystemPatch, type WifishState } from '../../src/shared/api';
+import {
+  API_BASE, type ChannelName, type ChannelPatch, type ColumnMessage, type DisplayPrefs, type SystemPatch, type VesselSettings,
+  type WifishState,
+} from '../../src/shared/api';
 
 export interface StreamHandlers {
   state(s: WifishState | null): void;
   display(d: DisplayPrefs): void;
+  vessel(v: VesselSettings): void;
   column(c: ColumnMessage): void;
   reset(): void;
   live(): void;
@@ -24,6 +28,7 @@ export class PluginStream {
     es.addEventListener('open', () => this.h.connection(true));
     es.addEventListener('error', () => this.h.connection(false));
     es.addEventListener('display', (e) => this.h.display(JSON.parse((e as MessageEvent).data)));
+    es.addEventListener('vessel', (e) => this.h.vessel(JSON.parse((e as MessageEvent).data)));
     es.addEventListener('state', (e) => this.h.state(JSON.parse((e as MessageEvent).data)));
     es.addEventListener('col', (e) => this.h.column(JSON.parse((e as MessageEvent).data)));
     es.addEventListener('reset', () => this.h.reset());
@@ -56,3 +61,5 @@ export const setChannel = (ch: ChannelName, patch: ChannelPatch) => post(`/chann
 export const setSystem = (patch: SystemPatch) => post('/system', patch);
 /** Save display units on the plugin for every viewer; resolves to the units now kept. */
 export const setDisplay = (patch: DisplayPrefs) => post<DisplayPrefs>('/display', patch);
+/** Save vessel settings on the plugin; resolves to the settings now kept. */
+export const setVessel = (patch: VesselSettings) => post<VesselSettings>('/vessel', patch);

@@ -2,15 +2,17 @@
 // Signal K server's Express router and in the stand-alone dev server.
 //
 //   GET  api/state             current WifishState
-//   GET  api/stream            Server-Sent Events: "display", "state", "col" (backlog first, then live)
+//   GET  api/stream            Server-Sent Events: "display", "state", "vessel", "col" (backlog first, then live)
 //   POST api/channel/:channel  ChannelPatch  (channel = sonar | downvision)
 //   POST api/system            SystemPatch
 //   GET  api/display           DisplayPrefs (depth and temperature units shared by all viewers)
 //   POST api/display           DisplayPrefs patch
+//   GET  api/vessel            VesselSettings (waterline-to-transducer distance)
+//   POST api/vessel            VesselSettings patch
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Engine } from './engine';
-import { DisplayStore, parseDisplayPatch } from './display';
+import { DisplayStore, VesselStore, parseDisplayPatch, parseVesselPatch } from './store';
 import { CHANNELS, type ChannelName, type ChannelPatch, type ColumnMessage, type SystemPatch, type WifishState } from './shared/api';
 
 type Req = IncomingMessage & { body?: unknown };
@@ -111,11 +113,16 @@ export class Api {
   #unsub: (() => void) | null = null;
   #bound: Engine | null = null;
   #display: DisplayStore;
+  #vessel: VesselStore;
 
-  /** `engine` is a getter so the plugin can swap engines on restart; `display` keeps the viewers' units. */
-  constructor(engine: () => Engine | null, display = new DisplayStore()) {
+  /**
+   * `engine` is a getter so the plugin can swap engines on restart; `display` keeps the
+   * viewers' units and `vessel` the waterline-to-transducer distance.
+   */
+  constructor(engine: () => Engine | null, display = new DisplayStore(), vessel = new VesselStore()) {
     this.#engine = engine;
     this.#display = display;
+    this.#vessel = vessel;
   }
 
   /** Route a request whose path is relative to the plugin root. Returns false when not ours. */
@@ -131,13 +138,17 @@ export class Api {
       sendJson(res, 200, this.#display.get());
       return true;
     }
+    if (method === 'GET' && path === '/api/vessel') {
+      sendJson(res, 200, this.#vessel.get());
+      return true;
+    }
     if (method === 'GET' && path === '/api/stream') {
       if (this.#clients.size >= MAX_STREAMS) return sendJson(res, 503, { error: 'too many viewers' }), true;
       this.#stream(req, res);
       return true;
     }
     const m = /^\/api\/channel\/(sonar|downvision)$/.exec(path);
-    if (method !== 'POST' || (!m && path !== '/api/system' && path !== '/api/display')) return false;
+    if (method !== 'POST' || (!m && path !== '/api/system' && path !== '/api/display' && path !== '/api/vessel')) return false;
     // JSON only: a cross-site form or text/plain POST (no CORS preflight) must not reach the sonar.
     if (!/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))) {
       return sendJson(res, 415, { error: 'Content-Type must be application/json' }), true;
@@ -155,6 +166,15 @@ export class Api {
       const d = this.#display.set(patch);
       this.#broadcast('display', d);
       return sendJson(res, 200, d), true;
+    }
+    if (path === '/api/vessel') {
+      // Kept while the plugin is stopped too; a running engine republishes depth with it.
+      const patch = parseVesselPatch(body);
+      if (typeof patch === 'string') return sendJson(res, 400, { error: patch }), true;
+      const v = this.#vessel.set(patch);
+      this.#engine()?.vesselChanged();
+      this.#broadcast('vessel', v);
+      return sendJson(res, 200, v), true;
     }
     const engine = this.#engine(); // read after the body: the plugin may have restarted meanwhile
     if (!engine) return sendJson(res, 503, { error: 'plugin not running' }), true;
@@ -207,7 +227,7 @@ export class Api {
     this.#clients.clear();
   }
 
-  /** Open an SSE stream: display units, current state, the column backlog, a 'live' marker, then live events and pings. */
+  /** Open an SSE stream: display units, current state, vessel settings, the column backlog, a 'live' marker, then live events and pings. */
   #stream(req: Req, res: Res): void {
     res.statusCode = 200;
     res.setHeader('Content-Type', 'text/event-stream');
@@ -219,6 +239,7 @@ export class Api {
     const engine = this.#engine();
     this.#write(res, 'display', this.#display.get());
     this.#write(res, 'state', engine ? engine.state() : null);
+    this.#write(res, 'vessel', this.#vessel.get());
     if (engine) for (const c of backlog(engine)) this.#write(res, 'col', c);
     this.#write(res, 'live', null);
     this.#clients.set(res, res.writableLength + MAX_UNREAD_BYTES);

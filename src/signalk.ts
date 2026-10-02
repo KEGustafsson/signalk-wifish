@@ -32,13 +32,28 @@ export function toDelta(values: PathValue[]): Delta {
  * transducer offset already applied (system settings off 60, PROTOCOL.md §6):
  * offset > 0 = transducer below waterline -> reported is below surface,
  * offset < 0 = offset to keel -> reported is below keel.
+ *
+ * The sonar holds one offset only. `surfaceToTransducerCm` (kept by the plugin, null =
+ * not set) adds depth below surface when the offset is to the keel or 0; when the
+ * offset is to the waterline, that offset is the distance and this one is not used.
+ * The offsets are published too, as Signal K defines them (both positive downwards):
+ * surfaceToTransducer and transducerToKeel, so belowSurface = belowTransducer +
+ * surfaceToTransducer and belowKeel = belowTransducer - transducerToKeel.
  */
-export function depthValues(reportedCm: number | null, offsetCm: number): PathValue[] {
+export function depthValues(reportedCm: number | null, offsetCm: number, surfaceToTransducerCm: number | null = null): PathValue[] {
   /** cm to metres, passing null (no bottom lock) through. */
   const m = (cm: number | null) => (cm === null ? null : cmToM(cm));
-  const out: PathValue[] = [{ path: PATH.depth, value: m(reportedCm === null ? null : reportedCm - offsetCm) }];
-  if (offsetCm > 0) out.push({ path: PATH.depthBelowSurface, value: m(reportedCm) });
-  if (offsetCm < 0) out.push({ path: PATH.depthBelowKeel, value: m(reportedCm) });
+  const belowTransducer = reportedCm === null ? null : reportedCm - offsetCm;
+  const out: PathValue[] = [{ path: PATH.depth, value: m(belowTransducer) }];
+  const surface = offsetCm > 0 ? offsetCm : surfaceToTransducerCm;
+  if (surface !== null) {
+    out.push({ path: PATH.depthBelowSurface, value: m(belowTransducer === null ? null : belowTransducer + surface) });
+    out.push({ path: PATH.surfaceToTransducer, value: m(surface) });
+  }
+  if (offsetCm < 0) {
+    out.push({ path: PATH.depthBelowKeel, value: m(reportedCm) });
+    out.push({ path: PATH.transducerToKeel, value: m(-offsetCm) });
+  }
   return out;
 }
 

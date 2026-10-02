@@ -131,6 +131,29 @@ describe('plugin HTTP API (demo source)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  test('vessel settings are shared by all viewers, survive a restart and reach Signal K', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wifish-'));
+    const json = { 'content-type': 'application/json' };
+    let { base, deltas } = await startPlugin({ source: 'demo' }, dir);
+    expect(await (await fetch(`${base}/api/vessel`)).json()).toEqual({});
+    const ctrl = new AbortController();
+    const reader = (await fetch(`${base}/api/stream`, { signal: ctrl.signal })).body!.getReader();
+    expect((await fetch(`${base}/api/vessel`, { method: 'POST', headers: json, body: '{"surfaceToTransducerCm":500}' })).status).toBe(400);
+    const r = await fetch(`${base}/api/vessel`, { method: 'POST', headers: json, body: '{"surfaceToTransducerCm":40}' });
+    expect(await r.json()).toEqual({ surfaceToTransducerCm: 40 });
+    let text = '';
+    while (!text.includes('event: vessel\ndata: {"surfaceToTransducerCm":40}')) text += new TextDecoder().decode((await reader.read()).value);
+    ctrl.abort();
+    expect(text).toContain('event: vessel\ndata: {}');
+    await sleep(1300); // the demo sonar sends bottom records
+    expect(deltas.flatMap((d) => d.updates[0].values)).toContainEqual({ path: 'environment.depth.surfaceToTransducer', value: 0.4 });
+    stop!();
+    await new Promise<void>((res) => server!.close(() => res()));
+    ({ base, deltas } = await startPlugin({ source: 'demo' }, dir));
+    expect(await (await fetch(`${base}/api/vessel`)).json()).toEqual({ surfaceToTransducerCm: 40 });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   test('replay without a file falls back to the demo', async () => {
     const { base } = await startPlugin({ source: 'replay' });
     await sleep(200);
