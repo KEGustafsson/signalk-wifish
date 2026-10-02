@@ -127,7 +127,7 @@ node tools/dump-raw.mjs raw.bin --id 0x270104 --hex
   ([docs/PROTOCOL.md §8](docs/PROTOCOL.md)): supply voltage, firmware version,
   device serial, bottom-record channel, the four message types the app ignores
   and the settings limits. What is left needs a Dragonfly (CHIRP channel,
-  multi-segment ping columns) — all of it cosmetic, none of it used by the app
+  multi-segment ping columns), and how those affect decoding and display is untested
 - [x] Signal K server plugin (TypeScript, vitest)
 - [x] Echogram stream and web UI
 - [ ] Waypoints (the app syncs them from the Dragonfly over TCP) as Signal K

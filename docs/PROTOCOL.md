@@ -73,7 +73,7 @@ GPS or waypoint store. The announcement repeats about once a second 📡.
 | 0 | u32 | message id ✅ |
 | 4 | u32 | total message length ✅ |
 | 8 | u32 | protocol version, must be 116 ✅ |
-| 12 | u32 | session value: the **device serial** in every device → client message 📡 (the app sends 0xDEADBEEF here in its keepalive and the device accepts it, so it is not checked) |
+| 12 | u32 | session value: the **device serial** in every device → client message 📡 (the app sends 0xDEADBEEF here in its keepalive and the device accepts it; no other value was tried) |
 | 16.. | | payload |
 
 ### Keepalive — `0x270100` (2556160), client → device, 37 bytes ✅
@@ -177,7 +177,7 @@ likely the reading behind the low-voltage error flag (0x27010D).
 | 35 | u8 | 0 📡 |
 | 36 | i16 | varies 288..296, noisy 📡 ❓ (an internal temperature in deci-°C would fit; its high byte, off 37, stayed 1) |
 | 38 | u8 | 0 📡 |
-| 39..1099 | char[] | status text, trimmed 🟡; all zero (empty) on a Wi-Fish 📡 |
+| 39..1099 | char[] | status text, NUL-terminated and trimmed 🟡; ends at off 1099 or at the end of the message, whichever comes first, so a message of the 1063-byte minimum carries 1024 bytes of it; all zero (empty) on a Wi-Fish 📡 |
 
 ### Ping data — 0x270101 ✅ (segmented; reassemble per ping)
 | Off | Type | Meaning |
