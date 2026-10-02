@@ -16,6 +16,8 @@ export interface EngineOptions {
   historyColumns?: number;
   emitDepth?: boolean;
   emitTemperature?: boolean;
+  /** Waterline-to-transducer distance kept by the plugin, cm; null = not set. */
+  surfaceToTransducerCm?: () => number | null;
   /** Receives Signal K deltas. */
   onDelta?: (d: Delta) => void;
   log?: (msg: string) => void;
@@ -84,6 +86,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       historyColumns: clampColumns(opts.historyColumns),
       emitDepth: opts.emitDepth ?? true,
       emitTemperature: opts.emitTemperature ?? true,
+      surfaceToTransducerCm: opts.surfaceToTransducerCm ?? (() => null),
       onDelta: opts.onDelta,
       log: opts.log,
     };
@@ -206,6 +209,11 @@ export class Engine extends EventEmitter<EngineEvents> {
     return null;
   }
 
+  /** The waterline-to-transducer distance changed: republish depth with it now. */
+  vesselChanged(): void {
+    this.#depth(this.session.bottomCm, true);
+  }
+
   /** Apply a system settings change from the UI. Returns an error message, or null when sent. */
   setSystem(patch: SystemPatch): string | null {
     if (!this.transport.canSend) return 'Sonar settings cannot be changed in this mode';
@@ -243,8 +251,8 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (cm === null && this.#depthPaths.size === 0) return; // nothing published yet, nothing to clear
     // The sonar applies its own offset to the depth it reports: use its confirmed value, not a pending change.
     const offset = this.session.deviceSystem?.transducerOffsetCm ?? 0;
-    const values = depthValues(cm, offset);
-    // A path that no longer applies (offset changed sign or went to 0) gets a final null,
+    const values = depthValues(cm, offset, this.#opts.surfaceToTransducerCm());
+    // A path that no longer applies (offset changed sign or went to 0, distance cleared) gets a final null,
     // otherwise the server would keep showing its last value.
     const current = new Set(values.map((v) => v.path));
     const gone: PathValue[] = [...this.#depthPaths].filter((p) => !current.has(p)).map((path) => ({ path, value: null }));

@@ -4,7 +4,7 @@ import { PALETTES, SONAR_PALETTES, DOWNVISION_PALETTES, cssColour } from './pale
 import { prefs, savePrefs } from './prefs';
 import { TILES } from './icons';
 import { DEPTH_UNITS, presetCm, type DepthUnit } from '../../src/shared/units';
-import type { ChannelName, ChannelPatch, ChannelSettingsView, DisplayPrefs, SystemPatch, WifishState } from '../../src/shared/api';
+import type { ChannelName, ChannelPatch, ChannelSettingsView, DisplayPrefs, SystemPatch, VesselSettings, WifishState } from '../../src/shared/api';
 import type { ViewConfig } from './prefs';
 
 /**
@@ -205,6 +205,10 @@ export interface Ctx {
   applyPrefs(): void;
   /** Use these display units here and save them on the plugin for every viewer. */
   setUnits(patch: DisplayPrefs): void;
+  /** Vessel settings the plugin keeps (waterline-to-transducer distance). */
+  vessel(): VesselSettings;
+  /** Save vessel settings on the plugin for every viewer. */
+  setVessel(patch: VesselSettings): void;
   onState(cb: (s: WifishState | null) => void): () => void;
 }
 
@@ -426,15 +430,31 @@ export function mainSettings(ctx: Ctx): DialogHandle {
   paintDepth();
   depthValue.addEventListener('click', () => transducerDepth(ctx, paintDepth));
 
+  const waterline = h('button', { class: 'link-btn' });
+  /**
+   * Waterline-to-transducer distance. A transducer depth set below the waterline already
+   * is that distance (shown, not editable); otherwise it is the plugin's own setting.
+   */
+  const paintWaterline = () => {
+    const off = ctx.state()?.system?.transducerOffsetCm ?? 0;
+    const v = ctx.vessel().surfaceToTransducerCm ?? null;
+    waterline.textContent = off > 0 ? `${formatOffset(off, ctx.depthUnit())} (transducer depth)`
+      : v === null ? 'Not set' : formatOffset(v, ctx.depthUnit());
+    waterline.disabled = off > 0;
+  };
+  paintWaterline();
+  waterline.addEventListener('click', () => waterlineDepth(ctx));
+
   const devUnit = s?.system ? DEPTH_UNITS.find((u) => u.code === s.system!.depthUnit) : undefined;
   const unitSel = select(
     [{ value: '', label: `Sonar setting${devUnit ? ` (${devUnit.label})` : ''}` }, ...DEPTH_UNITS.map((u) => ({ value: u.id, label: u.label }))],
-    prefs.depthUnit ?? '', (v) => { ctx.setUnits({ depthUnit: (v || null) as DisplayPrefs['depthUnit'] }); paintDepth(); }, 'Depth units');
+    prefs.depthUnit ?? '', (v) => { ctx.setUnits({ depthUnit: (v || null) as DisplayPrefs['depthUnit'] }); paintDepth(); paintWaterline(); }, 'Depth units');
   const tempSel = select([{ value: 'F', label: '°F' }, { value: 'C', label: '°C' }], prefs.tempUnit, (v) => ctx.setUnits({ tempUnit: v as 'C' | 'F' }), 'Temperature units');
 
   /** Append a labelled settings row to the table. */
   const row = (label: string, el: HTMLElement) => table.append(h('div', { class: 'row' }, h('span', { class: 'label' }, label), el));
   row('Transducer depth', depthValue);
+  row('Waterline to transducer', waterline);
   row('Depth units', unitSel);
   row('Temperature units', tempSel);
   // Like the app, the simulator switch is offered for the Wi-Fish only (MainSettingsFragment.h()).
@@ -442,16 +462,16 @@ export function mainSettings(ctx: Ctx): DialogHandle {
     row('Simulator', toggle(s.system.simulator, (v) => { ctx.sendSystem({ simulator: v }).catch(() => {}); }, 'Simulator'));
   }
   // Another viewer may change the shared units while this dialog is open.
-  const unsub = ctx.onState(() => { paintDepth(); unitSel.value = prefs.depthUnit ?? ''; tempSel.value = prefs.tempUnit; });
+  const unsub = ctx.onState(() => { paintDepth(); paintWaterline(); unitSel.value = prefs.depthUnit ?? ''; tempSel.value = prefs.tempUnit; });
   return openDialog(table, { title: 'Settings', modal: true, className: 'main', onClose: unsub });
 }
 
-/** Transducer depth (app: TransducerDepthFragment). Applied when the dialog closes. */
-export function transducerDepth(ctx: Ctx, onDone: () => void): DialogHandle {
-  const u = ctx.depthUnit();
-  const off = ctx.state()?.system?.transducerOffsetCm ?? 0;
-  const a = Math.abs(off);
-  const body = h('div', { class: 'transducer' });
+/**
+ * Distance picker of the transducer depth dialog: feet and inches, or tenths of a metre
+ * (up to 3.0 m) or fathom. `read` returns the picked distance in cm, at most 300.
+ */
+function distancePicker(u: DepthUnit, cm: number): { row: HTMLElement; read: () => number } {
+  const a = Math.abs(cm);
   const row = h('div', { class: 'td-row' });
   let read: () => number;
   if (u.id === 'ft') {
@@ -466,6 +486,14 @@ export function transducerDepth(ctx: Ctx, onDone: () => void): DialogHandle {
     row.append(tenth, h('span', { class: 'unit' }, u.symbol));
     read = () => (u.id === 'm' ? Number(tenth.value) * 10 : Math.trunc(Number(tenth.value) * 0.1 * u.cm));
   }
+  return { row, read: () => Math.min(300, read()) };
+}
+
+/** Transducer depth (app: TransducerDepthFragment). Applied when the dialog closes. */
+export function transducerDepth(ctx: Ctx, onDone: () => void): DialogHandle {
+  const off = ctx.state()?.system?.transducerOffsetCm ?? 0;
+  const body = h('div', { class: 'transducer' });
+  const { row, read } = distancePicker(ctx.depthUnit(), off);
   const below = h('input', { type: 'radio', name: 'td', id: 'td-below' });
   const above = h('input', { type: 'radio', name: 'td', id: 'td-above' });
   (off < 0 ? above : below).checked = true;
@@ -480,11 +508,39 @@ export function transducerDepth(ctx: Ctx, onDone: () => void): DialogHandle {
     title: 'Transducer depth', modal: true, className: 'transducer-dialog',
     onClose: () => {
       if (!touched) return;
-      const cm = Math.min(300, read());
+      const cm = read();
       const value = above.checked ? -cm : cm;
       if (value !== off) ctx.sendSystem({ transducerOffsetCm: value }).then(onDone, () => {});
     },
   });
+}
+
+/**
+ * Waterline to transducer: kept by the plugin (the sonar holds only the transducer depth)
+ * and used for depth below surface while the transducer depth is set to the keel or 0.
+ * Applied when the dialog closes; Clear removes it.
+ */
+export function waterlineDepth(ctx: Ctx): DialogHandle {
+  const cur = ctx.vessel().surfaceToTransducerCm ?? null;
+  const body = h('div', { class: 'transducer' });
+  const { row, read } = distancePicker(ctx.depthUnit(), cur ?? 0);
+  // As in transducerDepth: only a change the user made is saved, the lists round the value.
+  let touched = false;
+  row.addEventListener('change', () => { touched = true; });
+  const clear = h('button', { class: 'text-btn' }, 'Clear');
+  clear.disabled = cur === null;
+  let cleared = false;
+  body.append(row, h('p', { class: 'dialog-text' }, 'Used for depth below surface unless the transducer depth is set below the waterline.'),
+    h('div', { class: 'dialog-buttons' }, clear));
+  const d = openDialog(body, {
+    title: 'Waterline to transducer', modal: true, className: 'transducer-dialog',
+    onClose: () => {
+      if (cleared) ctx.setVessel({ surfaceToTransducerCm: null });
+      else if (touched && read() !== cur) ctx.setVessel({ surfaceToTransducerCm: read() });
+    },
+  });
+  clear.addEventListener('click', () => { cleared = true; d.close(); });
+  return d;
 }
 
 /** Help dialog explaining the echogram gestures and controls. */

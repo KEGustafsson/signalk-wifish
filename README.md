@@ -29,7 +29,9 @@ multicast announcement, keeps the session alive, decodes the "Sonar4" UDP protoc
 
 - publishes `environment.depth.belowTransducer` and `environment.water.temperature`
   (plus `environment.depth.belowSurface` or `belowKeel` when a transducer offset is set
-  on the unit),
+  on the unit, with `surfaceToTransducer` / `transducerToKeel`). The unit holds one
+  offset only; with it set to the keel, *Waterline to transducer* in the web app's
+  settings adds `belowSurface` as well,
 - streams echogram columns to the **Wi-Fish Sonar** web app, keeping recent history on the
   server so a browser opened later can scroll back,
 - relays settings changes from the web app to the unit.
@@ -74,12 +76,12 @@ The screen follows the Android app:
 | Pinch vertically / mouse wheel | zoom into the water column; the zoom box on the right shows the full range and follows the bottom. Double-tap to zoom out. |
 | Pinch horizontally / Ctrl + wheel | scroll speed |
 | Press and hold | depth, bottom, water temperature and time at that point |
-| ⋯ → Settings | transducer depth, depth and temperature units, simulator |
+| ⋯ → Settings | transducer depth, waterline to transducer, depth and temperature units, simulator |
 
 ![Sonar settings](docs/screenshot-settings.jpg)
 
-Depth and temperature units are kept by the plugin (in its data directory), so they are the
-same on every browser and device and survive restarts. Palettes, view and similar
+Depth and temperature units and the waterline-to-transducer distance are kept by the plugin
+(in its data directory), so they are the same on every browser and device and survive restarts. Palettes, view and similar
 preferences are stored per browser.
 
 ## Development

@@ -2,7 +2,7 @@
 //   node dist/devserver.js --demo [--wifish] [--port 3000]
 //   node dist/devserver.js --device [--iface 192.168.x.y] [--passive]
 //   node dist/devserver.js --replay raw.bin
-//   add --data <dir> to keep the web app's display units in <dir>/display.json
+//   add --data <dir> to keep the web app's display units and vessel settings in <dir>
 // Serves public/ at / and /signalk-wifish/, the API at /plugins/signalk-wifish/, and
 // prints Signal K deltas with --deltas.
 

@@ -60,6 +60,31 @@ describe('Engine', () => {
     e.stop();
   });
 
+  test('the waterline-to-transducer distance adds depth below surface and is republished when changed', () => {
+    const t = new FakeTransport();
+    const deltas: Delta[] = [];
+    let distance: number | null = null;
+    const e = new Engine(t, { onDelta: (d) => deltas.push(d), surfaceToTransducerCm: () => distance });
+    e.start();
+    t.feed(systemSettings(1, -30));
+    t.feed(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(970, 17)));
+    const values = () => deltas.flatMap((d) => d.updates[0].values);
+    expect(values()).toContainEqual({ path: 'environment.depth.belowKeel', value: 9.7 });
+    expect(values()).toContainEqual({ path: 'environment.depth.transducerToKeel', value: 0.3 });
+    expect(values().map((v) => v.path)).not.toContain('environment.depth.belowSurface');
+    deltas.length = 0;
+    distance = 40;
+    e.vesselChanged(); // at once, not with the next bottom record
+    expect(values()).toContainEqual({ path: 'environment.depth.belowSurface', value: 10.4 });
+    expect(values()).toContainEqual({ path: 'environment.depth.surfaceToTransducer', value: 0.4 });
+    deltas.length = 0;
+    distance = null;
+    e.vesselChanged();
+    expect(values()).toContainEqual({ path: 'environment.depth.belowSurface', value: null });
+    expect(values()).toContainEqual({ path: 'environment.depth.surfaceToTransducer', value: null });
+    e.stop();
+  });
+
   test('an offset change counts for depth only once the sonar confirms it; the watchdog resends it', () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'Date', 'performance'] });
     const t = new FakeTransport();
