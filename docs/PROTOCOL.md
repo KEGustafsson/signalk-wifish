@@ -311,7 +311,8 @@ the configuration of the channel being adjusted, Range settings to both channels
 | 82..93 | u8 | 1, 1, 1, 2, 50, 50, 1, 0, 1, 0, 0, 0 📡 (identical on all 32 configurations) | |
 
 On a Wi-Fish 📡 exactly one configuration is enabled (index **1**, DownVision);
-all 32 are broadcast all the same, and a client must draw only the enabled ones.
+the other 31 are broadcast too, each as its own record under its own index, and
+a client must draw only the enabled ones.
 The 30 configurations the unit never writes carry **uninitialised memory** in
 the name field — a leftover C++ string, `Error in COSSLinuxFile::Chec…`, starting
 at off 25 rather than at off 21, so a NUL-terminated read at off 21 yields the
@@ -389,6 +390,9 @@ supply ≈ 13.3 V:
 node tools/wifish-probe.mjs --iface <wlan IP> --no-keepalive --log raw.bin   # 150 s, 18 195 datagrams
 node tools/dump-raw.mjs raw.bin --id 0x270104 --hex                          # one message type
 ```
+
+The probe only listened (`--no-keepalive`): the Signal K plugin held the session
+throughout, sending its keepalive once a second (the two-client setup in §7).
 
 Field meanings were read off the capture by listing, per message id and per byte
 offset, which offsets are constant and which vary, then correlating the varying
