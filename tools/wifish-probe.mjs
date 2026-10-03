@@ -18,6 +18,10 @@ import {
 import { PATH, centiCToK, depthValues, toDelta, Throttle } from '../dist/signalk.js';
 import { CHANNEL, encodeRecord, readRawLog } from '../dist/rawlog.js';
 
+// Lost / give-up timing shared with the plugin's transport (src/device.ts) so the two cannot
+// drift apart. Older builds of dist/device.js do not export TIMING; the defaults mirror its values.
+const { TIMING = { RETRY_MS: 5000, QUIET_MS: 3000, GIVE_UP_MS: 20_000 } } = await import('../dist/device.js');
+
 const USAGE = `Usage: wifish-probe [options]
   --iface <ipv4>     local WLAN address (default: the 192.x address on the sonar's subnet)
   --log <file>       append raw capture (read with dump-raw.mjs)
@@ -57,7 +61,15 @@ const mono = () => performance.now();
 const userPath = (p) => path.resolve(process.env.INIT_CWD ?? process.cwd(), p);
 
 // ---------- outputs ----------
-let logFd = opts.log ? fs.openSync(userPath(opts.log), 'a') : null;
+let logFd = null;
+if (opts.log) {
+  try {
+    logFd = fs.openSync(userPath(opts.log), 'a');
+  } catch (e) {
+    console.error(`--log: ${e.message}`);
+    process.exit(1);
+  }
+}
 function logRaw(channel, buf) {
   if (logFd === null) return;
   try {
@@ -168,7 +180,14 @@ function summary() {
 
 // ---------- replay ----------
 if (opts.replay) {
-  for (const r of readRawLog(fs.readFileSync(userPath(opts.replay)))) {
+  let capture;
+  try {
+    capture = fs.readFileSync(userPath(opts.replay));
+  } catch (e) {
+    console.error(`--replay: ${e.message}`);
+    process.exit(1);
+  }
+  for (const r of readRawLog(capture)) {
     if (r.truncated) { console.warn(`[replay] truncated record at byte ${r.truncated.offset}`); break; }
     if (r.channel === CHANNEL.DATA || messageId(r.msg) > MsgId.UNIT) handleSonar(r.msg, r.channel === CHANNEL.DATA ? 'data' : 'disc');
   }
@@ -178,6 +197,11 @@ if (opts.replay) {
 }
 
 // ---------- interface ----------
+// The probe keeps its own discovery / data / control sockets instead of using the plugin's
+// DeviceTransport on purpose: --log must tag every datagram as a discovery or data record
+// (CHANNEL.DISCOVERY / CHANNEL.DATA, which dump-raw and the replay transport rely on), and
+// DeviceTransport does not expose which socket a message came in on. Only the timing
+// constants (TIMING, above) are shared with it.
 // Candidates as the app picks them (IPv4 starting with 192.), unless --iface is given.
 const candidates = opts.iface
   ? [{ address: opts.iface, netmask: null }]
@@ -202,7 +226,7 @@ let service = null, unit = null, iface = null, started = false, dataSock = null,
 const sameService = (a, b) => a.group === b.group && a.port === b.port && a.device === b.device && a.ctrlPort === b.ctrlPort;
 
 function stopSession() {
-  started = false;
+  started = false; stale = false;
   clearInterval(kaTimer); kaTimer = null;
   dataSock?.close(); dataSock = null;
   ctrlSock?.close(); ctrlSock = null;
@@ -247,10 +271,19 @@ function tick() {
   ctrlSock?.send(k, service.ctrlPort, service.device, (e) => e && warnOnce(`ka:${e.code}`, `[ka] send failed: ${e.message}`));
 }
 
+/** Each second, like the plugin: 'lost' after QUIET_MS of silence, drop the session after GIVE_UP_MS. */
 function watchdog() {
-  const quiet = mono() - lastRx > 5000;
+  const silence = mono() - lastRx;
+  if (silence > TIMING.GIVE_UP_MS) {
+    console.warn(`[watchdog] no sonar data for ${TIMING.GIVE_UP_MS / 1000} s, dropping the session; waiting for a new announcement`);
+    emitDepth(null);
+    stopSession();
+    service = null; // the next announcement starts a fresh session
+    return;
+  }
+  const quiet = silence > TIMING.QUIET_MS;
   if (quiet && !stale) {
-    console.warn('[watchdog] no sonar data for 5 s');
+    console.warn(`[watchdog] no sonar data for ${TIMING.QUIET_MS / 1000} s`);
     emitDepth(null);
   } else if (!quiet && stale) {
     console.log('[watchdog] data flowing again');

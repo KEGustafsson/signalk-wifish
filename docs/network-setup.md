@@ -57,14 +57,22 @@ nmcli con up wifish
 
 Pick any unused address in the sonar's range for the WLAN; `192.168.0.141` is
 an example. Multicast discovery still works, since `224.0.0.1` is link-local
-and does not depend on the subnet route. Set the plugin's **Wi-Fi interface
-address** (or the probe's `--iface`) to that WLAN address, because with both
-networks on `192.168.0.x` the automatic pick can land on the Ethernet side.
+and does not depend on the subnet route.
+
+The plugin's automatic interface pick copes with this setup: discovery listens
+on every `192.x` interface, and once the sonar announces itself the session
+joins the data group on every candidate whose subnet contains the sonar. With
+a `/32` address no subnet contains it, so the plugin joins on all candidates
+(Ethernet included) and the WLAN one receives the data. Setting the plugin's
+**Wi-Fi interface address** to the WLAN address remains the recommended
+explicit setting: it keeps the sonar sockets off the Ethernet side entirely,
+and it is what the probe needs (`--iface`), since the probe uses a single
+interface.
 
 If the LAN uses a different range, no special routing is needed. Both
-interfaces may still have `192.x` addresses; the probe then picks the one on
-the same subnet as the announced device, and `--iface <WLAN address>` forces
-it.
+interfaces may still have `192.x` addresses; the plugin then uses the
+candidates on the same subnet as the announced device (the probe picks the
+first such one), and the interface option / `--iface <WLAN address>` forces it.
 
 ## Docker
 
