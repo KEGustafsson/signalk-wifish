@@ -14,8 +14,6 @@ export const isDepthUnitId = (v: unknown): v is DepthUnitId => (DEPTH_UNIT_IDS a
 export const MAX_TRANSDUCER_OFFSET_CM = 300;
 /** Deepest range the unit accepts, cm (its settings-limit message advertises 40000, PROTOCOL.md §5). */
 export const MAX_RANGE_CM = 40_000;
-/** Smallest Deep − Shallow window accepted from the web app, cm (the app's smallest preset window is 5 ft). */
-export const MIN_RANGE_WINDOW_CM = 100;
 
 export interface DepthUnit {
   /** Code used in system settings off 79. */
@@ -49,6 +47,18 @@ export const DEPTH_UNITS: readonly DepthUnit[] = Object.freeze([
   },
 ]);
 
+/** Range preset `i` of `u` in whole cm, as the app sends it. */
+export const presetCm = (u: DepthUnit, i: number): number => Math.trunc(u.ranges[i] * u.cm);
+
+/**
+ * Smallest Deep − Shallow window accepted from the web app, cm: the smallest gap between two
+ * adjacent range presets in any unit (5 ft to 6 ft, 30 cm), so every pair the Range dialog
+ * offers is accepted while a degenerate window (a few cm) is not.
+ */
+export const MIN_RANGE_WINDOW_CM = Math.min(
+  ...DEPTH_UNITS.flatMap((u) => u.ranges.slice(1).map((_, i) => presetCm(u, i + 1) - presetCm(u, i))),
+);
+
 /** Depth unit with this id ('ft', 'm', 'fa'); metres if unknown. */
 export function unitById(id: string): DepthUnit {
   return DEPTH_UNITS.find((u) => u.id === id) ?? DEPTH_UNITS[1];
@@ -57,9 +67,6 @@ export function unitById(id: string): DepthUnit {
 export function unitByCode(code: number): DepthUnit {
   return DEPTH_UNITS.find((u) => u.code === code) ?? DEPTH_UNITS[1];
 }
-
-/** Range preset `i` of `u` in whole cm, as the app sends it. */
-export const presetCm = (u: DepthUnit, i: number): number => Math.trunc(u.ranges[i] * u.cm);
 
 /** Snap a depth in cm to the nearest preset of `u` (the app does this when the unit changes). */
 export function snapToPreset(u: DepthUnit, cm: number): number {

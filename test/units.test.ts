@@ -1,8 +1,13 @@
 import { test, expect } from 'vitest';
-import { DEPTH_UNITS, unitById, unitByCode, presetCm, snapToPreset, depthLinesFor, formatDepth, formatTemp } from '../src/shared/units';
+import { DEPTH_UNITS, MIN_RANGE_WINDOW_CM, unitById, unitByCode, presetCm, snapToPreset, depthLinesFor, formatDepth, formatTemp } from '../src/shared/units';
 
 test('range tables line up with their depth-line counts', () => {
   for (const u of DEPTH_UNITS) expect(u.lines.length).toBe(u.ranges.length);
+});
+
+test('the minimum range window is the smallest gap between adjacent presets (5 ft to 6 ft)', () => {
+  expect(MIN_RANGE_WINDOW_CM).toBe(presetCm(unitById('ft'), 2) - presetCm(unitById('ft'), 1));
+  expect(MIN_RANGE_WINDOW_CM).toBe(30);
 });
 
 test('unit lookup and presets', () => {

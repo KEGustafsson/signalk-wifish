@@ -20,7 +20,8 @@
   picker cap visible.
 - Signal K output: no duplicate `null` delta after a lost link; heartbeats are
   timer-driven (depth every 5 s, temperature every 10 s even when unchanged).
-- Range limits 0..400 m with a minimum window; a settings retry rebuilds its command
+- Range limits 0..400 m, with Deep at least 30 cm below Shallow (the smallest gap between
+  two presets, 5 ft to 6 ft); a settings retry rebuilds its command
   on the sonar's newer seq.
 - Accessibility of the gear button and the history scrollbar (keyboard, labels).
 - `tools/wifish-probe.mjs` exits with a message, not a stack trace, on a bad `--log`

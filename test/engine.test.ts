@@ -478,14 +478,14 @@ describe('Engine lifecycle and output timing', () => {
     e.stop();
   });
 
-  test('range changes must leave a 1 m window against the held settings', () => {
+  test('range changes must leave the smallest preset window (30 cm) against the held settings', () => {
     const t = new FakeTransport();
     const e = new Engine(t);
     e.start();
     t.feed(channelSettings(0, 1, { shallow: 0, deep: 2000 }));
     t.feed(channelSettings(1, 1, { shallow: 0, deep: 2000 }));
-    expect(e.setChannel('sonar', { rangeShallowCm: 1950 })).toMatch(/at least 100 cm/);
-    expect(e.setChannel('sonar', { rangeShallowCm: 1900 })).toBeNull();
+    expect(e.setChannel('sonar', { rangeShallowCm: 1980 })).toMatch(/at least 30 cm/);
+    expect(e.setChannel('sonar', { rangeShallowCm: 1970 })).toBeNull();
     e.stop();
   });
 });

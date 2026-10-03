@@ -15,15 +15,28 @@ import type { ColumnMessage, ChannelName } from '../src/shared/api';
 import { encodeRecord } from '../src/rawlog';
 import { MsgId } from '../src/sonar4';
 import { msg } from './helpers';
+import { DEPTH_UNITS, presetCm } from '../src/shared/units';
 
 describe('patch validation', () => {
+  test('every Shallow/Deep preset pair the Range dialog offers is accepted, in every unit', () => {
+    // The dialog lets Deep be any preset deeper than Shallow; 5 ft and 6 ft are only 30 cm apart.
+    for (const u of DEPTH_UNITS) {
+      for (let i = 0; i < u.ranges.length; i++) {
+        for (let j = i + 1; j < u.ranges.length; j++) {
+          const patch = { rangeShallowCm: presetCm(u, i), rangeDeepCm: presetCm(u, j) };
+          expect(parseChannelPatch(patch), `${u.ranges[i]}..${u.ranges[j]} ${u.symbol}`).toEqual(patch);
+        }
+      }
+    }
+  });
+
   test('channel patch', () => {
     expect(parseChannelPatch({ gain: 40.4, gainAuto: false })).toEqual({ gain: 40, gainAuto: false });
     expect(parseChannelPatch({ gain: 101 })).toMatch(/0..100/);
     expect(parseChannelPatch({ gainAuto: 'yes' })).toMatch(/boolean/);
     expect(parseChannelPatch({ rangeShallowCm: 500, rangeDeepCm: 400 })).toMatch(/less than/);
-    expect(parseChannelPatch({ rangeShallowCm: 500, rangeDeepCm: 550 })).toMatch(/at least 100 cm/); // window too small
-    expect(parseChannelPatch({ rangeShallowCm: 500, rangeDeepCm: 600 })).toEqual({ rangeShallowCm: 500, rangeDeepCm: 600 });
+    expect(parseChannelPatch({ rangeShallowCm: 500, rangeDeepCm: 520 })).toMatch(/at least 30 cm/); // window too small
+    expect(parseChannelPatch({ rangeShallowCm: 500, rangeDeepCm: 530 })).toEqual({ rangeShallowCm: 500, rangeDeepCm: 530 });
     expect(parseChannelPatch({ rangeDeepCm: 40_001 })).toMatch(/0..40000/);
     expect(parseChannelPatch({ rangeDeepCm: -1 })).toMatch(/0..40000/);
     expect(parseChannelPatch({ rangeDeepCm: 2000.4 })).toEqual({ rangeDeepCm: 2000 });
