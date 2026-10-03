@@ -2,7 +2,7 @@
 // Every parse* takes a Uint8Array (Buffer ok) and returns a plain object, or
 // null when the datagram is too short / not the expected message.
 
-import { MAX_TRANSDUCER_OFFSET_CM } from './shared/units';
+import { MAX_TRANSDUCER_OFFSET_CM, MAX_RANGE_CM } from './shared/units';
 export { MAX_TRANSDUCER_OFFSET_CM } from './shared/units';
 
 export const VERSION = 116;
@@ -28,15 +28,14 @@ export const UNIT_TYPES: Readonly<Record<number, string>> = Object.freeze({
 });
 export const UNIT_WIFISH = 63;
 
-/** Sonar channel as reported by ping results off 95. */
-export const Channel = Object.freeze({ SONAR: 0, DOWNVISION: 1 });
+/** Sonar channel as reported by ping results off 95: 0 sonar, 1 DownVision. */
 export type ChannelId = 0 | 1;
 
 /** Error-status bit that means "supply voltage too low" (the app's low-voltage dialog). */
 export const ERROR_LOW_VOLTAGE = 0x100;
 
-/** Minimum datagram length each parser needs (the fields it reads). */
-const MIN = { ANNOUNCE: 36, UNIT: 52, BOTTOM: 22, ENV: 30, ERROR: 20, PING_RESULTS: 112, PING_DATA: 37 };
+/** Minimum length of the discovery messages (no §5 entry); the 0x2701xx parsers use MIN_LEN. */
+const MIN = { ANNOUNCE: 36, UNIT: 52 };
 
 /** Minimum message length the app accepts per id (PROTOCOL.md §5). Shorter = malformed. */
 export const MIN_LEN: Readonly<Record<number, number>> = Object.freeze({
@@ -46,7 +45,13 @@ export const MIN_LEN: Readonly<Record<number, number>> = Object.freeze({
 export const CHAN_SETTINGS_LEN = 94;
 export const SYS_SETTINGS_LEN = 562;
 
-export interface Header { id: number; length: number; version: number; seq: number }
+export interface Header {
+  id: number;
+  length: number;
+  version: number;
+  /** Session value (off 12): the device serial in every device → client message (§4); not a sequence number. */
+  session: number;
+}
 
 /** True when `b` is as long as both its header length field and the §5 minimum for its id. */
 export function isWellFormed(b: Uint8Array, h: Header): boolean {
@@ -59,9 +64,21 @@ export function isWellFormed(b: Uint8Array, h: Header): boolean {
 const dv = (b: Uint8Array) => new DataView(b.buffer, b.byteOffset, b.byteLength);
 /** Dotted-quad IPv4 address from the 4 bytes at offset `o`. */
 const ip4 = (b: Uint8Array, o: number) => `${b[o]}.${b[o + 1]}.${b[o + 2]}.${b[o + 3]}`;
-/** Latin-1 string from a NUL-padded fixed-width field `[from, to)`, cut at the first NUL and trimmed. */
-const cstr = (b: Uint8Array, from: number, to: number) =>
-  new TextDecoder('latin1').decode(b.subarray(from, Math.min(to, b.length))).replace(/\0.*$/s, '').trim();
+const latin1 = new TextDecoder('latin1');
+/**
+ * Latin-1 string from a NUL-padded fixed-width field `[from, to)`: cut at the first NUL,
+ * C0/C1 control bytes removed, trimmed. Name fields can hold uninitialised memory
+ * (PROTOCOL.md §6), so nothing about their content is trusted.
+ */
+function cstr(b: Uint8Array, from: number, to: number): string {
+  const stop = Math.min(to, b.length);
+  const keep: number[] = [];
+  for (let i = from; i < stop && b[i] !== 0; i++) {
+    const c = b[i];
+    if (c >= 0x20 && (c < 0x7f || c > 0x9f)) keep.push(c);
+  }
+  return latin1.decode(Uint8Array.from(keep)).trim();
+}
 
 /** True for a message id of the 0x2701xx (sonar data and settings) family; discovery ids 0 and 1 are not. */
 export const isSonarMessage = (id: number | null): id is number => id !== null && id >>> 8 === 0x2701;
@@ -77,7 +94,7 @@ export function parseHeader(b: Uint8Array): Header | null {
   const v = dv(b);
   const id = v.getUint32(0, true);
   if (!isSonarMessage(id)) return null;
-  return { id, length: v.getUint32(4, true), version: v.getUint32(8, true), seq: v.getUint32(12, true) };
+  return { id, length: v.getUint32(4, true), version: v.getUint32(8, true), session: v.getUint32(12, true) };
 }
 
 export interface Announce { service: number; group: string; port: number; device: string; ctrlPort: number }
@@ -124,21 +141,21 @@ export interface Bottom { depthCm: number | null; quality: number; channel: numb
 
 /** 0x270108. depthCm null = no bottom lock (INT32_MIN). */
 export function parseBottom(b: Uint8Array): Bottom | null {
-  if (b.length < MIN.BOTTOM || messageId(b) !== MsgId.BOTTOM) return null;
+  if (b.length < MIN_LEN[MsgId.BOTTOM] || messageId(b) !== MsgId.BOTTOM) return null;
   const d = dv(b).getInt32(17, true);
   return { depthCm: d === -0x80000000 ? null : d, quality: b[16], channel: b[21] };
 }
 
-/** 0x270104. waterTempCentiC null = invalid (INT16_MIN). Kept integer; convert at the edge. */
+/** 0x270104 (68 bytes like the app requires). waterTempCentiC null = invalid (INT16_MIN). Kept integer; convert at the edge. */
 export function parseEnv(b: Uint8Array): { waterTempCentiC: number | null } | null {
-  if (b.length < MIN.ENV || messageId(b) !== MsgId.ENV) return null;
+  if (b.length < MIN_LEN[MsgId.ENV] || messageId(b) !== MsgId.ENV) return null;
   const t = dv(b).getInt16(28, true);
   return { waterTempCentiC: t === -0x8000 ? null : t };
 }
 
 /** 0x27010D. */
 export function parseError(b: Uint8Array): { flags: number; lowVoltage: boolean } | null {
-  if (b.length < MIN.ERROR || messageId(b) !== MsgId.ERROR) return null;
+  if (b.length < MIN_LEN[MsgId.ERROR] || messageId(b) !== MsgId.ERROR) return null;
   const flags = dv(b).getUint32(16, true);
   return { flags, lowVoltage: (flags & ERROR_LOW_VOLTAGE) !== 0 };
 }
@@ -153,9 +170,9 @@ export function parseSystemStatus(b: Uint8Array): SystemStatus | null {
 
 export interface PingResults { seq: number; channel: number; rangeStartCm: number; rangeEndCm: number }
 
-/** 0x27010B. */
+/** 0x27010B (130 bytes like the app requires). */
 export function parsePingResults(b: Uint8Array): PingResults | null {
-  if (b.length < MIN.PING_RESULTS || messageId(b) !== MsgId.PING_RESULTS) return null;
+  if (b.length < MIN_LEN[MsgId.PING_RESULTS] || messageId(b) !== MsgId.PING_RESULTS) return null;
   const v = dv(b);
   return { seq: b[16], channel: b[95], rangeStartCm: v.getInt32(104, true), rangeEndCm: v.getInt32(108, true) };
 }
@@ -165,12 +182,15 @@ export interface PingSegment {
   segment: number; count: number; setting: number; samples: Uint8Array;
 }
 
-/** 0x270101 segment. `samples` is a view into b (copy before b is reused). */
+/**
+ * 0x270101 segment. `samples` is a view into b (copy before b is reused), ending at the
+ * header length (a longer datagram is trailing padding) or the datagram end if shorter.
+ */
 export function parsePingData(b: Uint8Array): PingSegment | null {
-  if (b.length < MIN.PING_DATA || messageId(b) !== MsgId.PING_DATA) return null;
+  if (b.length < MIN_LEN[MsgId.PING_DATA] || messageId(b) !== MsgId.PING_DATA) return null;
   const v = dv(b);
   const len = Math.min(v.getUint32(4, true), b.length);
-  if (len < MIN.PING_DATA) return null;
+  if (len < MIN_LEN[MsgId.PING_DATA]) return null;
   return {
     error: v.getUint32(16, true), offset: v.getUint32(20, true), total: v.getUint32(24, true),
     dataType: b[32], seq: b[33], segment: b[34], count: b[35], setting: b[36],
@@ -224,11 +244,11 @@ export interface ChannelSettings {
 export type ChannelSettingsPatch = Partial<Pick<ChannelSettings,
   'rangeAuto' | 'rangeShallowCm' | 'rangeDeepCm' | 'gainAuto' | 'gain' | 'contrastAuto' | 'contrast' | 'noiseFilterAuto' | 'noiseFilter'>>;
 
-/** 0x270102. The app rejects anything but exactly 94 bytes and indexes >= 32. */
+/** 0x270102. Like the app, rejects anything but exactly 94 bytes (datagram and header length) and indexes >= PING_CONFIGS. */
 export function parseChannelSettings(b: Uint8Array): ChannelSettings | null {
-  if (b.length < CHAN_SETTINGS_LEN || messageId(b) !== MsgId.CHAN_SETTINGS) return null;
+  if (b.length !== CHAN_SETTINGS_LEN || messageId(b) !== MsgId.CHAN_SETTINGS) return null;
   const v = dv(b);
-  if (v.getUint32(4, true) !== CHAN_SETTINGS_LEN || b[CS.INDEX] >= 32) return null;
+  if (v.getUint32(4, true) !== CHAN_SETTINGS_LEN || b[CS.INDEX] >= PING_CONFIGS) return null;
   return {
     seq: v.getInt32(CS.SEQ, true),
     index: b[CS.INDEX],
@@ -246,24 +266,34 @@ export function parseChannelSettings(b: Uint8Array): ChannelSettings | null {
   };
 }
 
-/** Round and clamp to a 0..100 percentage. */
-const pct = (n: number) => Math.max(0, Math.min(100, Math.round(n)));
+/** Round and clamp to a 0..100 percentage; null (no change) when not a finite number. */
+const pct = (n: number | undefined): number | null =>
+  n !== undefined && Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n))) : null;
+/** Round and clamp a range value to 0..MAX_RANGE_CM; null (no change) when negative or not a finite number. */
+const rangeCm = (n: number | undefined): number | null =>
+  n !== undefined && Number.isFinite(n) && n >= 0 ? Math.min(MAX_RANGE_CM, Math.round(n)) : null;
 
-/** Copy of a received 0x270102 with `patch` applied and seq set. Percentages are clamped to 0..100 (the app ignores values outside it). */
+/**
+ * Copy of a received 0x270102 with `patch` applied and seq set. Percentages are rounded
+ * and clamped to 0..100 (the app ignores values outside it), range values rounded and
+ * clamped to MAX_RANGE_CM; a negative range or a non-finite number leaves the field as is.
+ */
 export function buildChannelSettings(raw: Uint8Array, patch: ChannelSettingsPatch, seq: number): Uint8Array {
   if (raw.length < CHAN_SETTINGS_LEN) throw new Error('channel settings template too short');
   const b = Uint8Array.from(raw.subarray(0, CHAN_SETTINGS_LEN));
   const v = dv(b);
   v.setInt32(CS.SEQ, seq, true);
+  const shallow = rangeCm(patch.rangeShallowCm), deep = rangeCm(patch.rangeDeepCm);
+  const gain = pct(patch.gain), contrast = pct(patch.contrast), noise = pct(patch.noiseFilter);
   if (patch.rangeAuto !== undefined) b[CS.RANGE_AUTO] = patch.rangeAuto ? 1 : 0;
-  if (patch.rangeShallowCm !== undefined && patch.rangeShallowCm >= 0) v.setInt32(CS.RANGE_SHALLOW, Math.round(patch.rangeShallowCm), true);
-  if (patch.rangeDeepCm !== undefined && patch.rangeDeepCm >= 0) v.setInt32(CS.RANGE_DEEP, Math.round(patch.rangeDeepCm), true);
+  if (shallow !== null) v.setInt32(CS.RANGE_SHALLOW, shallow, true);
+  if (deep !== null) v.setInt32(CS.RANGE_DEEP, deep, true);
   if (patch.gainAuto !== undefined) b[CS.GAIN_AUTO] = patch.gainAuto ? 1 : 0;
-  if (patch.gain !== undefined) b[CS.GAIN] = pct(patch.gain);
+  if (gain !== null) b[CS.GAIN] = gain;
   if (patch.contrastAuto !== undefined) b[CS.CONTRAST_AUTO] = patch.contrastAuto ? 1 : 0;
-  if (patch.contrast !== undefined) b[CS.CONTRAST] = pct(patch.contrast);
+  if (contrast !== null) b[CS.CONTRAST] = contrast;
   if (patch.noiseFilterAuto !== undefined) b[CS.NOISE_AUTO] = patch.noiseFilterAuto ? 2 : 0;
-  if (patch.noiseFilter !== undefined) b[CS.NOISE] = pct(patch.noiseFilter);
+  if (noise !== null) b[CS.NOISE] = noise;
   return b;
 }
 
@@ -336,8 +366,10 @@ interface Partial_ { buf: Uint8Array; next: number; filled: number; t: number; d
  * Faithful to the app: a column starts at segment 0, any gap drops it, it
  * completes at segment == count-1, and its length is the bytes received.
  * Adds bounds checks so a malformed segment is dropped instead of throwing or
- * allocating 4 GB, and expires partial columns and old results so a wrapped
- * seq can't be glued onto stale data.
+ * allocating 4 GB, requires segments to be contiguous (each starts where the
+ * previous one ended), and expires partial columns and old results so a
+ * wrapped seq can't be glued onto stale data. `dropped` counts partial columns
+ * discarded for any of these reasons, including one restarted by a new segment 0.
  */
 export class PingAssembler {
   #pings = new Map<number, Partial_>();
@@ -377,10 +409,11 @@ export class PingAssembler {
     }
     let p = this.#pings.get(s.seq);
     if (s.segment === 0) {
+      if (p) this.dropped++; // a new segment 0 restarts the ping; the partial column it replaces is lost
       p = { buf: new Uint8Array(s.total), next: 0, filled: 0, t: now, dataType: s.dataType, setting: s.setting };
       this.#pings.set(s.seq, p);
     }
-    if (!p || p.next !== s.segment || p.buf.length !== s.total || now - p.t > this.staleMs) return this.#drop(s.seq);
+    if (!p || p.next !== s.segment || p.buf.length !== s.total || s.offset !== p.filled || now - p.t > this.staleMs) return this.#drop(s.seq);
     p.buf.set(s.samples, s.offset);
     p.filled += s.samples.length;
     p.next++;

@@ -24,11 +24,16 @@ export interface SessionColumn {
 
 interface Held<T> { parsed: T; raw: Uint8Array }
 /** A settings change sent to the sonar and not yet confirmed by its broadcasts. */
-interface Pending<T> extends Held<T> {
+interface Pending<T, P> extends Held<T> {
   sentAt: number;
   sends: number;
   /** The sonar broadcast older settings after our last send: the change did not land (yet). */
   stale: boolean;
+  /**
+   * Our change, cumulative over the unconfirmed changes it was built on, so a resend can be
+   * rebuilt on whatever the sonar holds now (another client may have changed it meanwhile).
+   */
+  patch: P;
 }
 
 /** Resend an unconfirmed settings change after this long (UDP may drop it). */
@@ -48,6 +53,9 @@ export interface SessionEvents {
   warn: [string];
 }
 
+/** Byte-for-byte equality of two datagrams. */
+const sameBytes = (a: Uint8Array, b: Uint8Array): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
+
 export class Sonar4Session extends EventEmitter<SessionEvents> {
   readonly seen = new Map<number, number>();
   asm = new PingAssembler();
@@ -60,11 +68,10 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
   #system: Held<SystemSettings> | null = null;
   #channels = new Map<number, Held<ChannelSettings>>();
   /** Changes we sent that the sonar has not confirmed yet; shown in place of its values meanwhile. */
-  #pendingSystem: Pending<SystemSettings> | null = null;
-  #pendingChannels = new Map<number, Pending<ChannelSettings>>();
+  #pendingSystem: Pending<SystemSettings, SystemSettingsPatch> | null = null;
+  #pendingChannels = new Map<number, Pending<ChannelSettings, ChannelSettingsPatch>>();
   /** Ping configuration index last seen per channel (0 = sonar, 1 = DownVision). */
   readonly configIndex: [number | null, number | null] = [null, null];
-  columns = 0;
   #warned = new Set<string>();
 
   /** System settings: our unconfirmed change if any, else the device's; null before any arrived. */
@@ -92,20 +99,26 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
     return this.unit !== null && this.#channels.size >= PING_CONFIGS && REQUIRED.every((id) => this.seen.has(id));
   }
 
-  /** Forget per-connection state (the app resets its decoders on reconnect). */
+  /** Forget per-connection state (the app resets its decoders on reconnect); warnings may repeat for the new connection. */
   reset(): void {
     this.seen.clear();
     this.unit = null;
     this.#system = null;
     this.#channels.clear();
     this.configIndex[0] = this.configIndex[1] = null;
-    this.bottomCm = null;
-    this.waterTempCentiC = null;
+    this.clearReadings();
     this.errorFlags = null;
     this.systemStatus = null;
     this.#pendingSystem = null;
     this.#pendingChannels.clear();
+    this.#warned.clear();
     this.asm = new PingAssembler();
+  }
+
+  /** Forget the bottom depth and water temperature without emitting (the link dropped; the app blanks both). */
+  clearReadings(): void {
+    this.bottomCm = null;
+    this.waterTempCentiC = null;
   }
 
   /** Emit `warn` with `msg` only the first time `key` is seen, so a bad stream doesn't flood the log. */
@@ -222,7 +235,6 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
     let endCm = cs.rangeAuto ? r.rangeEndCm : cs.rangeDeepCm;
     if (!(endCm > 0)) { endCm = r.rangeEndCm > 0 ? r.rangeEndCm : 1000; }
     if (!(startCm >= 0 && startCm < endCm)) startCm = 0;
-    this.columns++;
     this.emit('column', { channel, configIndex, seq, samples, startCm, endCm });
   }
 
@@ -247,11 +259,12 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
       if (!Object.keys(p).length) continue;
       const idx = this.indexFor(ch);
       // Build on an unconfirmed change, so a quick second change keeps the first one.
-      const base = this.#pendingChannels.get(idx) ?? this.#channels.get(idx);
+      const prev = this.#pendingChannels.get(idx);
+      const base = prev ?? this.#channels.get(idx);
       if (!base) continue;
       const raw = buildChannelSettings(base.raw, p, base.parsed.seq + 1);
       const parsed = parseChannelSettings(raw)!;
-      this.#pendingChannels.set(idx, { parsed, raw, sentAt: now, sends: 1, stale: false });
+      this.#pendingChannels.set(idx, { parsed, raw, sentAt: now, sends: 1, stale: false, patch: { ...prev?.patch, ...p } });
       this.emit('channelSettings', parsed);
       out.push(raw);
     }
@@ -260,28 +273,39 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
 
   /** System settings datagram for a change, or null before the device sent its settings. */
   buildSystemCommand(patch: SystemSettingsPatch, now = Date.now()): Uint8Array | null {
-    const base = this.#pendingSystem ?? this.#system;
+    const prev = this.#pendingSystem;
+    const base = prev ?? this.#system;
     if (!base) return null;
     const raw = buildSystemSettings(base.raw, patch, base.parsed.seq + 1);
     const parsed = parseSystemSettings(raw)!;
-    this.#pendingSystem = { parsed, raw, sentAt: now, sends: 1, stale: false };
+    this.#pendingSystem = { parsed, raw, sentAt: now, sends: 1, stale: false, patch: { ...prev?.patch, ...patch } };
     this.emit('systemSettings', parsed);
     return raw;
   }
 
   /**
    * Call about once a second. Returns unconfirmed changes to send again: after RESEND_MS,
-   * or at once when the sonar broadcast older settings since the last send. After
-   * MAX_SENDS, a change the sonar still reports as not applied is dropped and its own
-   * values are shown again. A sonar that broadcasts nothing gives no such evidence, so
-   * the change stays shown.
+   * or at once when the sonar broadcast older settings since the last send. A stale change
+   * is rebuilt on what the sonar holds now, at its seq + 1: when another client changed the
+   * settings meanwhile (a broadcast newer than our base but older than our seq), its change
+   * survives and our seq stays ahead instead of resending an obsolete copy. After MAX_SENDS,
+   * a change the sonar still reports as not applied is dropped and its own values are shown
+   * again. A sonar that broadcasts nothing gives no such evidence, so the change stays shown.
    */
   retryPending(now = Date.now()): Uint8Array[] {
     const out: Uint8Array[] = [];
-    /** Resend `p`, or report that it is to be dropped (true). */
-    const step = (p: Pending<unknown>): boolean => {
+    /** Resend `p` (rebuilt on `held` when stale), or report that it is to be dropped (true). */
+    const step = <T, P>(p: Pending<T, P>, held: Held<T> | null, build: (held: Held<T>, patch: P) => Held<T>, event: () => void): boolean => {
       if (!p.stale && now - p.sentAt < RESEND_MS) return false;
       if (p.sends >= MAX_SENDS) return p.stale;
+      if (p.stale && held) {
+        const fresh = build(held, p.patch);
+        if (!sameBytes(fresh.raw, p.raw)) {
+          p.raw = fresh.raw;
+          p.parsed = fresh.parsed;
+          event();
+        }
+      }
       p.sends++;
       p.sentAt = now;
       p.stale = false;
@@ -289,16 +313,27 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
       return false;
     };
     for (const [idx, p] of this.#pendingChannels) {
-      if (!step(p)) continue;
+      const held = this.#channels.get(idx) ?? null;
+      const build = (h: Held<ChannelSettings>, patch: ChannelSettingsPatch): Held<ChannelSettings> => {
+        const raw = buildChannelSettings(h.raw, patch, h.parsed.seq + 1);
+        return { raw, parsed: parseChannelSettings(raw)! };
+      };
+      if (!step(p, held, build, () => this.emit('channelSettings', p.parsed))) continue;
       this.#pendingChannels.delete(idx);
       this.emit('warn', `sonar did not apply the settings change for ping configuration ${idx}; showing its own values`);
-      const held = this.#channels.get(idx);
       if (held) this.emit('channelSettings', held.parsed);
     }
-    if (this.#pendingSystem && step(this.#pendingSystem)) {
-      this.#pendingSystem = null;
-      this.emit('warn', 'sonar did not apply the system settings change; showing its own values');
-      if (this.#system) this.emit('systemSettings', this.#system.parsed);
+    const ps = this.#pendingSystem;
+    if (ps) {
+      const build = (h: Held<SystemSettings>, patch: SystemSettingsPatch): Held<SystemSettings> => {
+        const raw = buildSystemSettings(h.raw, patch, h.parsed.seq + 1);
+        return { raw, parsed: parseSystemSettings(raw)! };
+      };
+      if (step(ps, this.#system, build, () => this.emit('systemSettings', ps.parsed))) {
+        this.#pendingSystem = null;
+        this.emit('warn', 'sonar did not apply the system settings change; showing its own values');
+        if (this.#system) this.emit('systemSettings', this.#system.parsed);
+      }
     }
     return out;
   }
