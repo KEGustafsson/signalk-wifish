@@ -2,6 +2,9 @@
 // Every parse* takes a Uint8Array (Buffer ok) and returns a plain object, or
 // null when the datagram is too short / not the expected message.
 
+import { MAX_TRANSDUCER_OFFSET_CM } from './shared/units';
+export { MAX_TRANSDUCER_OFFSET_CM } from './shared/units';
+
 export const VERSION = 116;
 export const DISCOVERY = { group: '224.0.0.1', port: 5800 } as const;
 export const SERVICE_SONAR = 39;
@@ -60,6 +63,9 @@ const ip4 = (b: Uint8Array, o: number) => `${b[o]}.${b[o + 1]}.${b[o + 2]}.${b[o
 const cstr = (b: Uint8Array, from: number, to: number) =>
   new TextDecoder('latin1').decode(b.subarray(from, Math.min(to, b.length))).replace(/\0.*$/s, '').trim();
 
+/** True for a message id of the 0x2701xx (sonar data and settings) family; discovery ids 0 and 1 are not. */
+export const isSonarMessage = (id: number | null): id is number => id !== null && id >>> 8 === 0x2701;
+
 /** Message id at offset 0, or null if < 4 bytes. */
 export function messageId(b: Uint8Array): number | null {
   return b.length >= 4 ? dv(b).getUint32(0, true) : null;
@@ -70,7 +76,7 @@ export function parseHeader(b: Uint8Array): Header | null {
   if (b.length < HEADER_LEN) return null;
   const v = dv(b);
   const id = v.getUint32(0, true);
-  if (id >>> 8 !== 0x2701) return null;
+  if (!isSonarMessage(id)) return null;
   return { id, length: v.getUint32(4, true), version: v.getUint32(8, true), seq: v.getUint32(12, true) };
 }
 
@@ -263,8 +269,6 @@ export function buildChannelSettings(raw: Uint8Array, patch: ChannelSettingsPatc
 
 /** Byte offsets in the 562-byte system settings, 0x270106. */
 export const SS = Object.freeze({ SEQ: 16, NAME: 20, TRANSDUCER_OFFSET: 60, DEPTH_UNIT: 79, SIMULATOR: 80 });
-/** Transducer offset limit the app enforces, cm. */
-export const MAX_TRANSDUCER_OFFSET_CM = 300;
 
 export interface SystemSettings {
   seq: number;
