@@ -218,6 +218,68 @@ describe('Sonar4Session', () => {
       s.reset();
       expect(s.pending).toBe(false);
     });
+
+    test('a stale change is rebuilt on another client\'s newer settings, keeping both changes', () => {
+      const s = held(); // configuration 0 at seq 5, gain 10
+      const shown: number[][] = [];
+      s.on('channelSettings', (c) => shown.push([c.seq, c.gain, c.contrast, c.noiseFilter]));
+      s.buildChannelCommands(0, { gain: 80 }, 0); // seq 6
+      s.buildChannelCommands(0, { contrast: 20 }, 10); // seq 7, built on the unconfirmed seq 6
+      // Another client's change landed first: the sonar now holds seq 6 with noise filter 33.
+      const other = channelSettings(0, 6, { gain: 10 });
+      other[CS.NOISE] = 33;
+      s.handle(other);
+      expect(s.pending).toBe(true);
+      const [resend] = s.retryPending(20);
+      const p = parseChannelSettings(resend)!;
+      // Rebuilt on the sonar's seq 6 copy at seq 7: their noise filter survives, our gain and contrast are re-applied.
+      expect(p).toMatchObject({ seq: 7, gain: 80, contrast: 20, noiseFilter: 33 });
+      expect(s.channelSettings(0)).toMatchObject({ gain: 80, contrast: 20, noiseFilter: 33 });
+      expect(shown.at(-1)).toEqual([7, 80, 20, 33]);
+      // The sonar applies it and confirms.
+      const confirm = channelSettings(0, 7, { gain: 80 });
+      confirm[CS.CONTRAST] = 20; confirm[CS.NOISE] = 33;
+      s.handle(confirm);
+      expect(s.pending).toBe(false);
+      expect(s.retryPending(5000)).toEqual([]);
+    });
+
+    test('a stale system change is rebuilt on the sonar\'s newer copy too', () => {
+      const s = new Sonar4Session();
+      s.handle(systemSettings(3, 0, 1));
+      s.buildSystemCommand({ transducerOffsetCm: 40 }, 0); // seq 4
+      s.buildSystemCommand({ simulator: true }, 1); // seq 5
+      s.handle(systemSettings(4, 0, 2)); // another client switched the unit to fathoms
+      const [resend] = s.retryPending(10);
+      expect(parseSystemSettings(resend)).toMatchObject({ seq: 5, transducerOffsetCm: 40, simulator: true, depthUnit: 2 });
+      expect(s.system).toMatchObject({ transducerOffsetCm: 40, simulator: true, depthUnit: 2 });
+    });
+  });
+
+  test('clearReadings blanks depth and temperature without emitting', () => {
+    const s = new Sonar4Session();
+    let events = 0;
+    s.on('bottom', () => events++);
+    s.on('temperature', () => events++);
+    s.handle(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(1234, 17)));
+    s.handle(msg(MsgId.ENV, 68, (b) => b.writeInt16LE(1530, 28)));
+    expect(events).toBe(2);
+    s.clearReadings();
+    expect(s.bottomCm).toBeNull();
+    expect(s.waterTempCentiC).toBeNull();
+    expect(events).toBe(2);
+  });
+
+  test('reset lets warnings repeat for the next connection', () => {
+    const s = new Sonar4Session();
+    const warns: string[] = [];
+    s.on('warn', (w) => warns.push(w));
+    const bad = msg(MsgId.BOTTOM, 22, (b) => b.writeUInt32LE(115, 8));
+    s.handle(bad); s.handle(bad);
+    expect(warns).toHaveLength(1);
+    s.reset();
+    s.handle(bad);
+    expect(warns).toHaveLength(2);
   });
 
   test('system command needs the device settings first', () => {

@@ -39,20 +39,24 @@ export function toDelta(values: PathValue[]): Delta {
  * The offsets are published too, as Signal K defines them (both positive downwards):
  * surfaceToTransducer and transducerToKeel, so belowSurface = belowTransducer +
  * surfaceToTransducer and belowKeel = belowTransducer - transducerToKeel.
+ *
+ * A depth is never negative: a reported depth smaller than the offset (the sonar
+ * reports a few cm below the transducer with a larger keel offset) is published as 0,
+ * as the app shows 0.0 for it. The offsets themselves are not clamped.
  */
 export function depthValues(reportedCm: number | null, offsetCm: number, surfaceToTransducerCm: number | null = null): PathValue[] {
-  /** cm to metres, passing null (no bottom lock) through. */
-  const m = (cm: number | null) => (cm === null ? null : cmToM(cm));
+  /** cm to metres, never negative, passing null (no bottom lock) through. */
+  const m = (cm: number | null) => (cm === null ? null : cmToM(Math.max(0, cm)));
   const belowTransducer = reportedCm === null ? null : reportedCm - offsetCm;
   const out: PathValue[] = [{ path: PATH.depth, value: m(belowTransducer) }];
   const surface = offsetCm > 0 ? offsetCm : surfaceToTransducerCm;
   if (surface !== null) {
     out.push({ path: PATH.depthBelowSurface, value: m(belowTransducer === null ? null : belowTransducer + surface) });
-    out.push({ path: PATH.surfaceToTransducer, value: m(surface) });
+    out.push({ path: PATH.surfaceToTransducer, value: cmToM(surface) });
   }
   if (offsetCm < 0) {
     out.push({ path: PATH.depthBelowKeel, value: m(reportedCm) });
-    out.push({ path: PATH.transducerToKeel, value: m(-offsetCm) });
+    out.push({ path: PATH.transducerToKeel, value: cmToM(-offsetCm) });
   }
   return out;
 }

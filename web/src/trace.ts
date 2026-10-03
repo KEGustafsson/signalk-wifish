@@ -5,20 +5,30 @@
 // added), so the ruler starts at 0 and the echoes move with the offset.
 // Pinch/wheel zooms vertically (a zoom box with the full range then appears on
 // the right), the optional A-scope shows the latest ping as a centred bar graph.
+// The geometry (column <-> pixel mapping, windows, rulers) lives in geometry.ts.
 
 import { lut } from './palettes';
 import type { ColumnStore, Col } from './history';
-import { depthLinesFor, snapToPreset, type DepthUnit } from '../../src/shared/units';
+import { unitById, type DepthUnit } from '../../src/shared/units';
 import type { ChannelName } from '../../src/shared/api';
+import {
+  BOTTOM_AT, RETRACK_PX, clampRight, clampSpeed, clampZoom, columnAt, columnWidth, depthAt, fullWindow, layout, minRight,
+  ruler, scrollTarget, visibleColumns, zoomWindow, type Layout, type Window,
+} from './geometry';
 
-const ZOOM_BOX = 0.15;
-const ASCOPE = 0.08;
-const MIN_WINDOW_CM = 50;
-const MAX_ZOOM = 20;
-const BOTTOM_AT = 0.75;
-const RETRACK_PX = 40;
+export type { Window } from './geometry';
 
-export interface Window { top: number; bottom: number }
+/** What a trace draws besides its columns; set together through `configure()`. */
+export interface TraceLook {
+  unit: DepthUnit;
+  /** Transducer offset, cm: displayed depth = depth below transducer + offsetCm. */
+  offsetCm: number;
+  palette: number;
+  depthLines: boolean;
+  aScope: boolean;
+  /** Horizontal speed: CSS px per column as the user picks it (1..5). */
+  speed: number;
+}
 
 export class TraceView {
   readonly el: HTMLDivElement;
@@ -36,12 +46,12 @@ export class TraceView {
   #dirty = true;
 
   palette = 4;
-  unit!: DepthUnit;
+  unit: DepthUnit = unitById('m');
   /** Transducer offset, cm: displayed depth = depth below transducer + offsetCm. */
   offsetCm = 0;
   depthLines = false;
   aScope = false;
-  /** Screen px per column. */
+  /** Speed as picked (CSS px per column, 1..5); the drawn column width is `columnWidth(speed, rs)` device px. */
   speed = 1;
   /** Right-edge column when paused; null = live. */
   endN: number | null = null;
@@ -90,6 +100,10 @@ export class TraceView {
   get right(): number { return this.endN ?? this.store.last; }
   /** True while a zoom window is set. */
   get zoomed(): boolean { return this.zoom !== null; }
+  /** Device px per column as drawn (whole pixels, so incremental scrolling can shift the picture). */
+  get colW(): number { return columnWidth(this.speed, this.#rs); }
+  /** CSS px per column as drawn; what a drag of that many px scrolls by one column. */
+  get cssPerColumn(): number { return this.colW / this.#rs; }
 
   /** Mark the trace for redraw on the next frame. */
   invalidate(): void { this.#dirty = true; }
@@ -117,15 +131,24 @@ export class TraceView {
   // ---------------------------------------------------------------- geometry
 
   /** CSS px widths: echogram area, zoom box, A-scope. */
-  layout(): { main: number; zoomBox: number; aScope: number } {
-    const zoomBox = this.zoomed ? Math.round(this.#cssW * ZOOM_BOX) : 0;
-    const aScope = this.aScope && this.channel === 'sonar' ? Math.round(this.#cssW * ASCOPE) : 0;
-    return { main: Math.max(10, this.#cssW - zoomBox - aScope), zoomBox, aScope };
+  layout(): Layout {
+    return layout(this.#cssW, this.zoomed, this.aScope && this.channel === 'sonar');
+  }
+
+  /** Device px widths of the echogram area and the zoom box (what the columns are laid out in). */
+  #devLayout(): { mainW: number; zbW: number } {
+    const L = this.layout();
+    return { mainW: Math.round(L.main * this.#rs), zbW: Math.round(L.zoomBox * this.#rs) };
   }
 
   /** Columns visible in the main area. */
   visibleColumns(): number {
-    return Math.ceil(this.layout().main / this.speed);
+    return visibleColumns(this.#devLayout().mainW, this.colW);
+  }
+
+  /** Oldest right-edge column that still fills the screen (or shows all of a short history). */
+  minRight(): number {
+    return minRight(this.store.first, this.store.last, this.visibleColumns());
   }
 
   /** Column that defines the full range (the right-most one shown). */
@@ -133,20 +156,9 @@ export class TraceView {
     return this.store.get(this.right) ?? this.store.cols[this.store.cols.length - 1];
   }
 
-  /**
-   * Unzoomed window, cm below the transducer: the reference ping's range snapped to
-   * the unit's presets (0..10 m without data), taken as *displayed* depths like the
-   * app, so it starts at 0 on the ruler and the echoes shift by the transducer offset.
-   */
+  /** Unzoomed window, cm below the transducer (see geometry.fullWindow). */
   fullWindow(): Window {
-    const c = this.refColumn();
-    const off = this.offsetCm;
-    if (!c) return { top: -off, bottom: 1000 - off };
-    // Like the app (z.b.h()), the window is the ping's range snapped to the unit's presets.
-    const top = this.unit ? snapToPreset(this.unit, c.startCm) : c.startCm;
-    const bottom = this.unit ? snapToPreset(this.unit, c.endCm) : c.endCm;
-    const w = bottom > top ? { top, bottom } : { top: c.startCm, bottom: c.endCm };
-    return { top: w.top - off, bottom: w.bottom - off };
+    return fullWindow(this.refColumn(), this.unit, this.offsetCm);
   }
 
   /** Window shown in the main area: the zoom, or else the full range. */
@@ -154,89 +166,111 @@ export class TraceView {
     return this.zoom ?? this.fullWindow();
   }
 
-  /** Column number under CSS x, and depth (cm below transducer) under CSS y. */
+  /**
+   * Column number under CSS x, and depth (cm below transducer) under CSS y, using the same
+   * device-pixel column layout as the drawing so hit-testing and picture agree.
+   */
   pick(x: number, y: number): { col: Col | undefined; depthCm: number } {
-    const L = this.layout();
-    const inMain = x < L.main;
-    // Zoom box (1 px per column) and A-scope show the full range.
+    const { mainW, zbW } = this.#devLayout();
+    const xd = Math.floor(x * this.#rs);
+    const inMain = xd < mainW;
+    // The zoom box (1 device px per column) and the A-scope show the full range.
     const n = inMain
-      ? this.right - Math.floor((L.main - 1 - x) / this.speed)
-      : x < L.main + L.zoomBox ? this.right - Math.floor(L.main + L.zoomBox - 1 - x) : this.right;
+      ? columnAt(this.right, mainW, xd, this.colW)
+      : xd < mainW + zbW ? columnAt(this.right, mainW + zbW, xd, 1) : this.right;
     const w = inMain ? this.window() : this.fullWindow();
-    return { col: this.store.get(n), depthCm: w.top + (y / this.#cssH) * (w.bottom - w.top) };
+    return { col: this.store.get(n), depthCm: depthAt(w, this.#cssH > 0 ? y / this.#cssH : 0) };
   }
 
   // ---------------------------------------------------------------- view changes
 
+  /** Set the right-edge column (null = live), marking the trace dirty only when it changed. */
+  #setRight(n: number | null): void {
+    if (n === this.endN) return;
+    this.endN = n;
+    this.#dirty = true;
+  }
+
   /** Scroll history by `cols` columns (positive = newer); reaching the newest column resumes live. */
   scrollBy(cols: number): void {
     if (!this.store.cols.length) return; // nothing to scroll through yet
-    const first = this.store.first, last = this.store.last;
-    // Oldest right edge that still fills the screen (or shows all of a short history).
-    const minRight = first + Math.min(this.visibleColumns(), last - first + 1) - 1;
-    const next = Math.round(this.right + cols);
-    this.endN = next >= last ? null : Math.max(minRight, next);
-    this.#dirty = true;
+    this.#setRight(scrollTarget(this.right, cols, this.store.first, this.store.last, this.visibleColumns()));
   }
 
   /** Put column `n` at the right edge; null or the newest column resumes live. */
   scrollTo(n: number | null): void {
-    this.endN = n === null || n >= this.store.last ? null : Math.max(this.store.first, Math.round(n));
-    this.#dirty = true;
+    this.#setRight(n === null ? null : clampRight(Math.round(n), this.store.first, this.store.last, this.visibleColumns()));
+  }
+
+  /**
+   * Put the column nearest in time to `t` (Unix ms) at the right edge, so two traces whose
+   * channels ping at different rates show the same moment; no columns = left alone.
+   */
+  scrollToTime(t: number): void {
+    const c = this.store.nearestByTime(t);
+    if (c) this.scrollTo(c.n);
   }
 
   /** Freeze at the newest column (true) or follow new pings again (false). */
   pause(p: boolean): void {
-    this.endN = p && this.store.cols.length ? this.store.last : null;
+    this.#setRight(p && this.store.cols.length ? this.store.last : null);
+  }
+
+  /** Set the speed (CSS px per column as picked), clamped to 1..5. */
+  setSpeed(s: number): void {
+    const v = clampSpeed(s);
+    if (v === this.speed) return;
+    this.speed = v;
     this.#dirty = true;
   }
 
-  /** Set screen px per column, clamped to 1..5. */
-  setSpeed(s: number): void {
-    this.speed = Math.max(1, Math.min(5, s));
-    this.#dirty = true;
+  /** Take a new look; only a change in what is drawn marks the trace for redraw. */
+  configure(look: TraceLook): void {
+    let changed = false;
+    if (look.unit.id !== this.unit.id) { this.unit = look.unit; changed = true; }
+    if (look.offsetCm !== this.offsetCm) { this.offsetCm = look.offsetCm; changed = true; }
+    if (look.palette !== this.palette) { this.palette = look.palette; changed = true; }
+    if (look.depthLines !== this.depthLines) { this.depthLines = look.depthLines; changed = true; }
+    if (look.aScope !== this.aScope) { this.aScope = look.aScope; changed = true; }
+    const speed = clampSpeed(look.speed);
+    if (speed !== this.speed) { this.speed = speed; changed = true; }
+    if (changed) this.#dirty = true;
   }
 
   /** Fit a zoom window in the full range within the zoom limits; null when it is (nearly) the full range. */
   #clamp(w: Window): Window | null {
-    const full = this.fullWindow();
-    const fullH = full.bottom - full.top;
-    let h = w.bottom - w.top;
-    if (h >= fullH * 0.98) return null;
-    h = Math.max(h, Math.max(MIN_WINDOW_CM, fullH / MAX_ZOOM));
-    let top = Math.max(full.top, Math.min(w.top, full.bottom - h));
-    if (!Number.isFinite(top)) top = full.top;
-    return { top, bottom: top + h };
+    return clampZoom(w, this.fullWindow());
   }
 
-  /** Vertical zoom by `factor` (> 1 = closer), anchored at CSS y, or at the bottom when tracking it. */
+  /** Replace the zoom window, marking the trace dirty only when it differs. */
+  #setZoom(z: Window | null): void {
+    const a = this.zoom;
+    if (a === z || (a && z && a.top === z.top && a.bottom === z.bottom)) return;
+    this.zoom = z;
+    this.#dirty = true;
+  }
+
+  /**
+   * Vertical zoom by `factor` (> 1 = closer), anchored at CSS y; without an anchor around the
+   * tracked bottom when it is in view, else around the middle.
+   */
   zoomBy(factor: number, anchorY?: number): void {
     const w = this.window();
-    const h = w.bottom - w.top;
-    const newH = h / factor;
-    const bottom = this.refColumn()?.bottomCm ?? null;
-    let top: number;
-    if (this.trackBottom && bottom !== null && bottom > w.top && bottom < w.bottom && anchorY === undefined) {
-      top = bottom - BOTTOM_AT * newH;
-    } else {
-      const fy = anchorY === undefined ? 0.5 : anchorY / this.#cssH;
-      const z = w.top + fy * h;
-      top = z - fy * newH;
-    }
+    const bottom = this.trackBottom ? (this.refColumn()?.bottomCm ?? null) : null;
+    const fy = anchorY === undefined ? undefined : this.#cssH > 0 ? anchorY / this.#cssH : 0.5;
     this.#anim = null;
-    this.zoom = this.#clamp({ top, bottom: top + newH });
+    this.#setZoom(this.#clamp(zoomWindow(w, factor, fy, bottom)));
     this.#afterManualMove();
   }
 
   /** Pan the zoom window with a vertical drag of `dyCss` px; stops following the bottom. */
   panBy(dyCss: number): void {
-    if (!this.zoom) return;
+    if (!this.zoom || !dyCss) return;
     const w = this.zoom;
-    const cmPerPx = (w.bottom - w.top) / this.#cssH;
+    const cmPerPx = (w.bottom - w.top) / Math.max(1, this.#cssH);
     this.#anim = null;
-    this.zoom = this.#clamp({ top: w.top - dyCss * cmPerPx, bottom: w.bottom - dyCss * cmPerPx });
+    this.#setZoom(this.#clamp({ top: w.top - dyCss * cmPerPx, bottom: w.bottom - dyCss * cmPerPx }));
     this.trackBottom = false;
-    this.#dirty = true;
   }
 
   /** After a gesture: keep following the bottom if it is still in view (app: b()). */
@@ -246,19 +280,17 @@ export class TraceView {
 
   /** Back to the full range, following the bottom again. */
   resetZoom(): void {
-    this.zoom = null;
+    this.#setZoom(null);
     this.#anim = null;
     this.trackBottom = true;
-    this.#dirty = true;
   }
 
-  /** Follow the bottom only if it is inside the window now, and remember where it is drawn. */
+  /** Follow the bottom only if it is inside the window now, and remember where it is drawn (nothing to redraw). */
   #afterManualMove(): void {
     const b = this.refColumn()?.bottomCm ?? null;
     const w = this.window();
     this.trackBottom = b !== null && b > w.top && b < w.bottom;
     this.#lastTrackY = b === null ? -1e9 : ((b - w.top) / (w.bottom - w.top)) * this.#cssH;
-    this.#dirty = true;
   }
 
   /** Keep the bottom near 75 % of the height while zoomed and live (app: t()). */
@@ -285,6 +317,12 @@ export class TraceView {
   /** Draw if something changed. Returns true when it drew. */
   draw(now: number): boolean {
     if (!this.visible) return false;
+    // The store trims old columns while paused: never point before the oldest filling position
+    // (a pause at the newest column stays a pause, so this only ever moves the view forward).
+    if (this.endN !== null && this.store.cols.length) {
+      const m = this.minRight();
+      if (this.endN < m) this.#setRight(m);
+    }
     const full = this.fullWindow();
     const fullKey = `${full.top}:${full.bottom}`;
     if (fullKey !== this.#lastFull) {
@@ -318,11 +356,9 @@ export class TraceView {
     }
     const pix = this.#pix!;
     const pal = lut(this.palette);
-    const rs = this.#rs;
     const L = this.layout();
-    const mainW = Math.round(L.main * rs);
-    const zbW = Math.round(L.zoomBox * rs);
-    const colW = this.speed * rs;
+    const { mainW, zbW } = this.#devLayout();
+    const colW = this.colW;
     const right = this.right;
     const w = this.window();
     const ctx = this.#img.getContext('2d')!;
@@ -335,7 +371,7 @@ export class TraceView {
     const from = incremental ? mainW - shift : 0;
     if (incremental) ctx.drawImage(this.#img, shift, 0, mainW - shift, H, 0, 0, mainW - shift, H);
     this.#columns(pix, W, H, from, mainW, colW, right, w, pal);
-    if (zbW > 0) this.#columns(pix, W, H, mainW, mainW + zbW, rs, right, this.fullWindow(), pal);
+    if (zbW > 0) this.#columns(pix, W, H, mainW, mainW + zbW, 1, right, this.fullWindow(), pal);
     if (L.aScope > 0) this.#aScope(pix, W, H, mainW + zbW, W, this.fullWindow(), pal);
     if (incremental) ctx.putImageData(this.#image, 0, 0, from, 0, W - from, H);
     else ctx.putImageData(this.#image, 0, 0);
@@ -351,7 +387,7 @@ export class TraceView {
     let lastN = NaN;
     let have = false;
     for (let x = x1 - 1; x >= x0; x--) {
-      const n = right - Math.floor((x1 - 1 - x) / colW);
+      const n = columnAt(right, x1, x, colW);
       if (n !== lastN) {
         lastN = n;
         const c = this.store.get(n);
@@ -386,12 +422,6 @@ export class TraceView {
       const colr = pal[v];
       for (let x = x0, o = y * W + x0; x < x1; x++, o++) pix[o] = Math.abs(x + 0.5 - mid) <= half ? colr : bg;
     }
-  }
-
-  /** Decimals needed to show multiples of `step` exactly (1, 0.5, 0.25 ...). */
-  static #decimals(step: number): number {
-    for (let d = 0; d < 3; d++) if (Math.abs(step * 10 ** d - Math.round(step * 10 ** d)) < 1e-6) return d;
-    return 2;
   }
 
   /** Draw the depth rulers and, when zoomed, the zoom box's window marker and its own ruler. */
@@ -439,23 +469,10 @@ export class TraceView {
    * Marks sit on round *displayed* depths, i.e. with the transducer offset added.
    */
   #ruler(ctx: CanvasRenderingContext2D, xr: number, H: number, w: Window, main: boolean): void {
-    const u = this.unit;
-    const spanCm = w.bottom - w.top;
-    if (!(spanCm > 0)) return;
-    const off = this.offsetCm;
-    const topU = (w.top + off) / u.cm;
-    const bottomU = (w.bottom + off) / u.cm;
+    const r = ruler(w, this.unit, this.offsetCm);
+    if (!r) return;
+    const { topU, bottomU, dec, marks } = r;
     const spanU = bottomU - topU;
-    // A preset range from the surface gets the app's line count; anything else a "nice" step.
-    const lines = w.top + off === 0 ? depthLinesFor(u, Math.round(spanCm)) : -1;
-    let step: number;
-    if (lines > 0) step = spanU / (lines + 1);
-    else {
-      const raw = spanU / 4.5;
-      const p = 10 ** Math.floor(Math.log10(raw));
-      step = [1, 2, 5, 10].map((m) => m * p).find((s) => s >= raw) ?? 10 * p;
-    }
-    const dec = TraceView.#decimals(step);
     /** Canvas y of a displayed depth (in units). */
     const y = (vU: number) => ((vU - topU) / spanU) * H;
     ctx.save();
@@ -468,9 +485,7 @@ export class TraceView {
     const small = 8, big = 14, pad = 4;
     ctx.font = '600 13px system-ui, sans-serif';
     ctx.textBaseline = 'middle';
-    const first = Math.ceil(topU / step - 1e-6);
-    for (let i = first; i * step < bottomU - 1e-6; i++) {
-      const v = i * step;
+    for (const v of marks) {
       const yy = y(v);
       if (yy < 18 || yy > H - 18) continue;
       ctx.fillRect(xr - small, Math.round(yy) - 1, small, 2);
@@ -506,7 +521,4 @@ export class TraceView {
     target.drawImage(this.#img, x, y, this.#cssW, this.#cssH);
     target.drawImage(this.#ov, x, y, this.#cssW, this.#cssH);
   }
-
-  /** Element size in CSS px as last measured. */
-  get cssSize(): { w: number; h: number } { return { w: this.#cssW, h: this.#cssH }; }
 }

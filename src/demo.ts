@@ -9,10 +9,11 @@ import {
 } from './sonar4';
 import { DEPTH_UNITS, presetCm } from './shared/units';
 import type { Transport, TransportEvents } from './transport';
+import type { DemoModel } from './shared/api';
 
 export interface DemoOptions {
   /** 'dragonfly' = CHIRP sonar + DownVision, 'wifish' = DownVision only (like a Wi-Fish dv). */
-  model?: 'dragonfly' | 'wifish';
+  model?: DemoModel;
   /** Pings per second per channel. */
   pingRate?: number;
   /** Deterministic scene for tests. */
@@ -52,7 +53,7 @@ interface Tree { x: number; width: number; heightCm: number }
 export class DemoDevice extends EventEmitter<TransportEvents> implements Transport {
   readonly kind = 'demo' as const;
   readonly canSend = true;
-  readonly model: 'dragonfly' | 'wifish';
+  readonly model: DemoModel;
   #rate: number;
   #rand: () => number;
   #timers: NodeJS.Timeout[] = [];
@@ -152,7 +153,7 @@ export class DemoDevice extends EventEmitter<TransportEvents> implements Transpo
 
     this.#tempCentiC += Math.round((this.#rand() - 0.5) * 6);
     this.#tempCentiC = Math.max(1200, Math.min(1900, this.#tempCentiC));
-    const env = header(MsgId.ENV, 68);
+    const env = header(MsgId.ENV, 68); // the §5 minimum the decoder accepts
     env.v.setInt16(28, this.#tempCentiC, true);
     this.emit('datagram', env.b);
 
@@ -224,7 +225,7 @@ export class DemoDevice extends EventEmitter<TransportEvents> implements Transpo
     }
     const seq = this.#pingSeq = (this.#pingSeq + 1) & 0xff;
 
-    const res = header(MsgId.PING_RESULTS, 130);
+    const res = header(MsgId.PING_RESULTS, 130); // the §5 minimum the decoder accepts
     res.b[16] = seq;
     res.b[95] = ch;
     res.v.setInt32(104, start, true);

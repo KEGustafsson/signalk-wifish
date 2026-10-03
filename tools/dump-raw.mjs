@@ -20,8 +20,11 @@ try {
   if (values.help) { console.log(USAGE); process.exit(0); }
   if (positionals.length !== 1) throw new Error('expected exactly one capture file');
   if (values.id !== undefined) {
-    idFilter = Number(values.id);
-    if (!Number.isInteger(idFilter) || idFilter < 0) throw new Error(`--id: not a number: ${values.id}`);
+    // Number('') and Number(' ') are 0, so check the spelling, not just the result.
+    const id = values.id.trim();
+    if (!/^(0x[0-9a-f]+|\d+)$/i.test(id)) throw new Error(`--id: expected a decimal or 0x hex message id, got '${values.id}'`);
+    idFilter = Number(id);
+    if (!Number.isSafeInteger(idFilter)) throw new Error(`--id: out of range: ${values.id}`);
   }
   [file] = positionals;
   hex = values.hex;

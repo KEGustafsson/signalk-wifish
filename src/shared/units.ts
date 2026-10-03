@@ -1,10 +1,24 @@
 // Depth units and range tables, as used by the Android app (e0.a in v0.7.1).
 // Shared by the plugin and the web app.
 
+/** Depth unit ids, as stored in display prefs and viewer prefs. */
+export const DEPTH_UNIT_IDS = ['ft', 'm', 'fa'] as const;
+export type DepthUnitId = (typeof DEPTH_UNIT_IDS)[number];
+/** True for one of DEPTH_UNIT_IDS. */
+export const isDepthUnitId = (v: unknown): v is DepthUnitId => (DEPTH_UNIT_IDS as readonly unknown[]).includes(v);
+
+/**
+ * Transducer offset limit the app enforces, cm; also the limit on the waterline-to-transducer
+ * distance the plugin keeps (system settings off 60, PROTOCOL.md §6).
+ */
+export const MAX_TRANSDUCER_OFFSET_CM = 300;
+/** Deepest range the unit accepts, cm (its settings-limit message advertises 40000, PROTOCOL.md §5). */
+export const MAX_RANGE_CM = 40_000;
+
 export interface DepthUnit {
   /** Code used in system settings off 79. */
   code: number;
-  id: 'ft' | 'm' | 'fa';
+  id: DepthUnitId;
   label: string;
   symbol: string;
   /** Centimetres per unit. */
@@ -33,6 +47,18 @@ export const DEPTH_UNITS: readonly DepthUnit[] = Object.freeze([
   },
 ]);
 
+/** Range preset `i` of `u` in whole cm, as the app sends it. */
+export const presetCm = (u: DepthUnit, i: number): number => Math.trunc(u.ranges[i] * u.cm);
+
+/**
+ * Smallest Deep − Shallow window accepted from the web app, cm: the smallest gap between two
+ * adjacent range presets in any unit (5 ft to 6 ft, 30 cm), so every pair the Range dialog
+ * offers is accepted while a degenerate window (a few cm) is not.
+ */
+export const MIN_RANGE_WINDOW_CM = Math.min(
+  ...DEPTH_UNITS.flatMap((u) => u.ranges.slice(1).map((_, i) => presetCm(u, i + 1) - presetCm(u, i))),
+);
+
 /** Depth unit with this id ('ft', 'm', 'fa'); metres if unknown. */
 export function unitById(id: string): DepthUnit {
   return DEPTH_UNITS.find((u) => u.id === id) ?? DEPTH_UNITS[1];
@@ -41,9 +67,6 @@ export function unitById(id: string): DepthUnit {
 export function unitByCode(code: number): DepthUnit {
   return DEPTH_UNITS.find((u) => u.code === code) ?? DEPTH_UNITS[1];
 }
-
-/** Range preset `i` of `u` in whole cm, as the app sends it. */
-export const presetCm = (u: DepthUnit, i: number): number => Math.trunc(u.ranges[i] * u.cm);
 
 /** Snap a depth in cm to the nearest preset of `u` (the app does this when the unit changes). */
 export function snapToPreset(u: DepthUnit, cm: number): number {
@@ -62,7 +85,10 @@ export function depthLinesFor(u: DepthUnit, rangeCm: number): number {
   return i < 0 ? -1 : u.lines[i];
 }
 
-export type TempUnit = 'C' | 'F';
+export const TEMP_UNITS = ['C', 'F'] as const;
+export type TempUnit = (typeof TEMP_UNITS)[number];
+/** True for 'C' or 'F'. */
+export const isTempUnit = (v: unknown): v is TempUnit => (TEMP_UNITS as readonly unknown[]).includes(v);
 
 /**
  * Water temperature as the app shows it (SonarTraceActivity.d()): °C tenths are
@@ -70,7 +96,7 @@ export type TempUnit = 'C' | 'F';
  */
 export function formatTemp(centiC: number | null, unit: TempUnit): { whole: string; frac: string; symbol: string } {
   const symbol = unit === 'C' ? '°C' : '°F';
-  if (centiC === null) return { whole: '--', frac: '-', symbol: '--' };
+  if (centiC === null || !Number.isFinite(centiC)) return { whole: '--', frac: '-', symbol: '--' };
   const tenthsC = Math.trunc(centiC / 10); // e.g. 1299 -> 129 (12.9 °C)
   const tenths = unit === 'C' ? tenthsC : Math.round(((tenthsC / 10) * 9 / 5 + 32) * 10);
   const sign = tenths < 0 ? '-' : '';
@@ -81,6 +107,7 @@ export function formatTemp(centiC: number | null, unit: TempUnit): { whole: stri
 /** Depth with one decimal, truncated like the app ("%d.%d"); negative depths show as 0.0 like the app. */
 export function formatDepth(cm: number | null, u: DepthUnit): { whole: string; frac: string; symbol: string } {
   if (cm === null || !Number.isFinite(cm)) return { whole: '--', frac: '-', symbol: u.symbol };
-  const hundredths = Math.trunc((Math.max(0, cm) / u.cm) * 100);
-  return { whole: String(Math.trunc(hundredths / 100)), frac: String(Math.trunc((hundredths % 100) / 10)), symbol: u.symbol };
+  // One division, then one truncation to tenths: (230 / 100) * 100 is 229.999…, which would show 2.30 m as 2.2.
+  const tenths = Math.trunc((Math.max(0, cm) / u.cm) * 10);
+  return { whole: String(Math.trunc(tenths / 10)), frac: String(tenths % 10), symbol: u.symbol };
 }

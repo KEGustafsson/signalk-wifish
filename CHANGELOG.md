@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Depth readout showed some values one tenth too low (2.30 m as 2.2 m): a floating-point
+  rounding error in the truncation to tenths.
+- Web app was admin-only on current Signal K servers: its routes are now registered at
+  readonly (viewing) and readwrite (changing settings).
+- `replay` without a file reports an error instead of silently running the demo.
+- Interface selection: every candidate interface on the sonar's subnet is joined (all
+  of them when none matches, e.g. a `/32` address), so overlapping subnets and the
+  `/32` setup in docs/network-setup.md work without the iface option.
+- Replay loops reset the session; the event stream reconnects after a 503/502.
+- Browser default units were uploaded as if the viewer had picked them.
+- Echogram: incremental redraw on HiDPI displays, negative depths clamped,
+  overlapping ping segments dropped, traces aligned by time when scrolled, the
+  scrollbar reaches the oldest column, wheel `deltaMode` normalised, feet range
+  picker cap visible.
+- Signal K output: no duplicate `null` delta after a lost link; heartbeats are
+  timer-driven (depth every 5 s, temperature every 10 s even when unchanged).
+- Range limits 0..400 m, with Deep at least 30 cm below Shallow (the smallest gap between
+  two presets, 5 ft to 6 ft); a settings retry rebuilds its command
+  on the sonar's newer seq.
+- Accessibility of the gear button and the history scrollbar (keyboard, labels).
+- `tools/wifish-probe.mjs` exits with a message, not a stack trace, on a bad `--log`
+  or `--replay` path; `tools/dump-raw.mjs --id ''` is a usage error.
+
+### Changed
+
+- Errors are logged through the server's error log.
+- SSE backlog for a new viewer capped at about 2 MiB.
+- Sourcemaps dropped from the production bundle.
+- CI runs once per PR (push only on `main` and tags) and tests Node 20 as well.
+
+### Internal
+
+- Shared constants (units, sources, channels, device timing, used by the probe too).
+- Tests for the device transport, replay, plugin, CLI tools, trace geometry and prefs.
+
 ## 0.1.0
 
 - `tools/wifish-probe.mjs --sk` published the depth the unit reports as
@@ -23,8 +62,6 @@
   with the transducer 0.3 m above the keel). The echogram moves by the transducer
   offset instead: up for above keel, down for below waterline, so the bottom echo
   sits at the displayed depth.
-- Fix the web app icon missing from the Signal K admin web app list: `appIcon` is
-  resolved relative to `public/`, so it now points to `./icon.svg`.
 - Signal K server plugin (TypeScript): discovers a Wi-Fish / Dragonfly Pro on the
   Wi-Fi, keeps the session alive and publishes `environment.depth.belowTransducer`
   (plus `belowSurface` / `belowKeel` when a transducer offset is set) and
@@ -40,6 +77,8 @@
   and DownVision echograms (split or single), depth ruler, depth and water
   temperature readout, pause and history scrolling, pinch/wheel zoom with zoom box,
   A-scope, depth lines, the app's nine palettes, snapshots, and trace point details.
+  Its icon shows in the Signal K admin web app list (`appIcon` is resolved relative
+  to `public/`, so it points to `./icon.svg`).
 - Sonar settings like the app (Sensitivity: gain, contrast, noise filter with Auto;
   Range: auto, shallow, deep; Options: palette, depth lines, A-scope) and main
   settings (transducer depth, depth and temperature units, simulator), sent to the

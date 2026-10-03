@@ -1,14 +1,39 @@
 // Messages between the plugin and the web app. Shared by both builds.
 
+import type { DepthUnitId, TempUnit } from './units';
+
 export const PLUGIN_ID = 'signalk-wifish';
 /** API root, relative to the server origin. */
 export const API_BASE = `/plugins/${PLUGIN_ID}/api`;
 
+/**
+ * offline    no usable network interface or socket (message says why); retrying
+ * searching  listening for the sonar's discovery announcement
+ * connecting announcement seen, keepalive running, waiting for sonar data
+ * connected  sonar data is flowing
+ * lost       was connected, no data for a few seconds; still trying
+ */
 export type LinkState = 'offline' | 'searching' | 'connecting' | 'connected' | 'lost';
-export type ChannelName = 'sonar' | 'downvision';
-export const CHANNELS: readonly ChannelName[] = ['sonar', 'downvision'];
-/** Ping-results channel code per name. */
+
+/** Where the plugin's datagrams come from (plugin option `source`, transport `kind`, state `source`). */
+export const SOURCES = ['device', 'demo', 'replay'] as const;
+export type SourceKind = (typeof SOURCES)[number];
+/** Built-in demo sonar models: 'dragonfly' = CHIRP sonar + DownVision, 'wifish' = DownVision only. */
+export const DEMO_MODELS = ['dragonfly', 'wifish'] as const;
+export type DemoModel = (typeof DEMO_MODELS)[number];
+
+/** Echogram columns kept per channel on the server (plugin option `historyColumns`) and at most per viewer. */
+export const DEFAULT_HISTORY_COLUMNS = 1500;
+export const MAX_HISTORY_COLUMNS = 20_000;
+
+export const CHANNELS = ['sonar', 'downvision'] as const;
+export type ChannelName = (typeof CHANNELS)[number];
+/** Ping-results channel code per name (sonar4 ping results off 95). */
 export const CHANNEL_CODE: Readonly<Record<ChannelName, 0 | 1>> = { sonar: 0, downvision: 1 };
+/** Channel name for a ping-results channel code. */
+export const channelByCode = (code: 0 | 1): ChannelName => CHANNELS[code];
+/** True for 'sonar' or 'downvision'. */
+export const isChannelName = (v: unknown): v is ChannelName => (CHANNELS as readonly unknown[]).includes(v);
 
 export interface ChannelSettingsView {
   configIndex: number;
@@ -27,7 +52,7 @@ export interface ChannelSettingsView {
 export interface WifishState {
   /** Identifies the plugin run (engine instance); a change means column numbering restarted. */
   epoch: string;
-  source: 'device' | 'demo' | 'replay';
+  source: SourceKind;
   link: LinkState;
   message: string;
   /** Settings can be sent (false in passive mode and for replays). */
@@ -51,8 +76,8 @@ export interface WifishState {
  */
 export interface DisplayPrefs {
   /** null = follow the sonar's own depth unit. */
-  depthUnit?: 'ft' | 'm' | 'fa' | null;
-  tempUnit?: 'C' | 'F';
+  depthUnit?: DepthUnitId | null;
+  tempUnit?: TempUnit;
 }
 
 /**

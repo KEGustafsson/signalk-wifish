@@ -3,19 +3,23 @@
 import { ColumnStore } from './history';
 import { TraceView } from './trace';
 import { PluginStream, setChannel, setDisplay, setSystem, setVessel } from './stream';
-import { prefs, savePrefs, storedKeys, type Prefs, type ViewConfig } from './prefs';
+import { prefs, savePrefs, storedKeys, MAX_SPEED, MIN_SPEED, type Prefs, type ViewConfig } from './prefs';
 import { ICONS } from './icons';
 import {
   aboutDialog, closeAll, helpDialog, mainSettings, messageBox, overflowMenu, sonarSettings, viewSwitcher,
   type Ctx, type DialogHandle,
 } from './dialogs';
 import { formatDepth, formatTemp, snapToPreset, unitByCode, unitById, type DepthUnit } from '../../src/shared/units';
-import type { ChannelName, DisplayPrefs, VesselSettings, WifishState } from '../../src/shared/api';
+import { isChannelName, type ChannelName, type DisplayPrefs, type VesselSettings, type WifishState } from '../../src/shared/api';
 
 declare const __VERSION__: string;
 
-/** Typed shorthand for document.getElementById. */
-const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+/** Typed shorthand for document.getElementById; throws when index.html lacks the element. */
+const $ = <T extends HTMLElement>(id: string): T => {
+  const el = document.getElementById(id);
+  if (!el) throw new Error(`wifish: index.html has no element with id "${id}"`);
+  return el as T;
+};
 
 // ------------------------------------------------------------------ model
 
@@ -52,7 +56,7 @@ function isWifish(): boolean {
 /** Channels that can be shown: DownVision on a Wi-Fish, else the active ones (both if none is active). */
 function availableChannels(): ChannelName[] {
   if (isWifish()) return ['downvision'];
-  const a = ORDER.filter((c) => state?.active[c]);
+  const a = ORDER.filter((c) => state?.active?.[c]);
   return a.length ? a : ORDER;
 }
 
@@ -69,49 +73,49 @@ function effectiveView(): ViewConfig {
 const tracesEl = $<HTMLDivElement>('traces');
 tracesEl.append(traces.sonar.el, Object.assign(document.createElement('div'), { className: 'separator' }), traces.downvision.el);
 
-/** Show or hide the traces for the effective view and mark them for redraw. */
+let appliedView: ViewConfig | null = null;
+/** Show or hide the traces for the effective view; only an actual change marks them for redraw. */
 function applyView(): void {
   const v = effectiveView();
+  if (v === appliedView) return;
+  appliedView = v;
   tracesEl.className = `traces ${v}`;
   traces.sonar.el.hidden = v === 'downvision';
   traces.downvision.el.hidden = v === 'sonar';
   for (const t of Object.values(traces)) t.invalidate();
 }
 
-let appliedUnit: string | null = null;
 /**
- * When the depth unit changes the app snaps the sonar's shallow/deep range to the new
- * unit's presets and sends it to both channels (SonarTraceActivity.i.a()).
+ * When the user changes the depth unit the app snaps the sonar's shallow/deep range to the new
+ * unit's presets and sends it (SonarTraceActivity.i.a()). Only the viewer that made the change
+ * sends it; the others merely receive the new unit from the server.
  */
 function unitChanged(u: DepthUnit): void {
-  const prev = appliedUnit;
-  appliedUnit = u.id;
-  if (prev === null || prev === u.id || !state?.canControl) return;
+  if (!state?.canControl) return;
   const ch: ChannelName = isWifish() ? 'downvision' : 'sonar';
-  const cs = state.channels[ch];
+  const cs = state.channels?.[ch];
   if (!cs) return;
   const shallow = snapToPreset(u, cs.rangeShallowCm);
   const deep = snapToPreset(u, cs.rangeDeepCm);
   if ((shallow === cs.rangeShallowCm && deep === cs.rangeDeepCm) || deep <= shallow) return;
-  ctx.sendChannel(ch, { rangeAuto: cs.rangeAuto, rangeShallowCm: shallow, rangeDeepCm: deep }).catch(() => {});
+  void ctx.sendChannel(ch, { rangeAuto: cs.rangeAuto, rangeShallowCm: shallow, rangeDeepCm: deep });
 }
 
+let appliedUnit: string | null = null;
 /** Push the prefs (unit, palettes, offset, depth lines, A-scope, speed) to the traces and repaint the databox. */
 function applyPrefs(): void {
   const u = depthUnit();
-  if (state) unitChanged(u);
-  const offset = state?.system?.transducerOffsetCm ?? 0;
-  traces.sonar.palette = prefs.paletteSonar;
-  traces.downvision.palette = prefs.paletteDownvision;
-  for (const t of Object.values(traces)) {
-    t.unit = u;
-    t.offsetCm = offset;
-    t.depthLines = prefs.depthLines;
-    t.aScope = prefs.aScope;
-    t.setSpeed(prefs.speed);
-    t.invalidate();
+  const offsetCm = state?.system?.transducerOffsetCm ?? 0;
+  const unitChangedNow = appliedUnit !== u.id;
+  appliedUnit = u.id;
+  for (const ch of ORDER) {
+    traces[ch].configure({
+      unit: u, offsetCm, palette: ch === 'sonar' ? prefs.paletteSonar : prefs.paletteDownvision,
+      depthLines: prefs.depthLines, aScope: prefs.aScope, speed: prefs.speed,
+    });
   }
-  paintDatabox();
+  // A new unit must show at once, not after the readout's 1 s throttle.
+  paintDatabox(unitChangedNow);
 }
 
 // ------------------------------------------------------------------ toolbar
@@ -132,14 +136,19 @@ for (const t of Object.values(traces)) t.gear.innerHTML = ICONS.gear;
 /** True when any trace is held on history instead of following new pings. */
 const paused = () => Object.values(traces).some((t) => !t.live);
 
+let pausePainted: boolean | null = null;
 /** Update the pause/play button; the fast-forward button and history scrollbar show only while paused. */
 function paintPause(): void {
   const p = paused();
+  if (p === pausePainted) return; // the icons are SVG markup: don't re-parse them on every column crossed
+  pausePainted = p;
   btnPause.innerHTML = p ? ICONS.play : ICONS.pause;
   btnPause.title = p ? 'Resume' : 'Pause';
   btnPause.setAttribute('aria-label', btnPause.title);
   btnFF.hidden = !p;
-  $('history-scroll').hidden = !p;
+  // Resuming hides the scrollbar: keep keyboard focus in the toolbar rather than losing it to the page.
+  if (!p && scrollEl.contains(document.activeElement)) btnPause.focus();
+  scrollEl.hidden = !p;
 }
 
 /** Pause or resume all traces together and update the toolbar. */
@@ -194,6 +203,46 @@ function showGear(ch: ChannelName): void {
 }
 for (const ch of ORDER) traces[ch].gear.addEventListener('click', (e) => { e.stopPropagation(); openSonarSettings(ch, traces[ch].gear); });
 
+// ------------------------------------------------------------------ history scrolling (both traces together)
+
+/** Traces not hidden by the current view. */
+const shownTraces = () => Object.values(traces).filter((t) => !t.el.hidden);
+
+/** Trace that leads history scrolling and the scrollbar: the first shown one with data. */
+function lead(): TraceView {
+  const shown = shownTraces();
+  return shown.find((t) => t.store.cols.length > 0) ?? shown[0] ?? traces.downvision;
+}
+
+/**
+ * Put the other traces at the same moment as the lead: channels ping at different rates, so
+ * scrolling both by a column count would drift apart; they are aligned by column time instead.
+ * When the lead is live, all resume live together.
+ */
+function followLead(l: TraceView): void {
+  for (const t of Object.values(traces)) {
+    if (t === l) continue;
+    if (l.live) { t.scrollTo(null); continue; }
+    const c = l.store.get(l.right);
+    if (c) t.scrollToTime(c.t); else t.scrollTo(l.right);
+  }
+  paintPause();
+}
+
+/** Scroll history by `cols` columns of the lead trace (positive = newer); the others follow by time. */
+function scrollHistory(cols: number): void {
+  const l = lead();
+  l.scrollBy(cols);
+  followLead(l);
+}
+
+/** Put column `n` of the lead trace at the right edge (null = live); the others follow by time. */
+function scrollHistoryTo(n: number | null): void {
+  const l = lead();
+  l.scrollTo(n);
+  followLead(l);
+}
+
 // ------------------------------------------------------------------ gestures
 
 interface P { id: number; x: number; y: number; x0: number; y0: number }
@@ -208,12 +257,15 @@ let wheelCarry = 0;
 /** Sideways drag has started scrolling history (live traces need a clear sideways move first). */
 let hScroll = false;
 
-/** Same local y in every trace for a zoom centred at clientY (the app maps the focus once). */
-function zoomAll(factor: number, clientX: number, clientY: number): void {
+/**
+ * Zoom every shown trace, each at the same local y as the one under the pointer (the app maps the
+ * focus once). A pinch zooms around the tracked bottom while the trace follows it; a mouse wheel
+ * (`atPointer`) always zooms around the pointer, like the app's wheel handling.
+ */
+function zoomAll(factor: number, clientX: number, clientY: number, atPointer = false): void {
   const t = traceAt(clientX, clientY);
   const localY = t ? clientY - t.el.getBoundingClientRect().top : undefined;
-  // While following the bottom the app zooms around it (scale to bottom), otherwise around the focus.
-  for (const tr of shownTraces()) tr.zoomBy(factor, tr.trackBottom ? undefined : localY);
+  for (const tr of shownTraces()) tr.zoomBy(factor, atPointer || !tr.trackBottom ? localY : undefined);
 }
 
 /** Visible trace under the given client point, if any. */
@@ -225,8 +277,12 @@ function traceAt(x: number, y: number): TraceView | null {
   }
   return null;
 }
-/** Traces not hidden by the current view. */
-const shownTraces = () => Object.values(traces).filter((t) => !t.el.hidden);
+
+/** Set the scrolling speed on every trace (1..5, saved by the caller). */
+function useSpeed(s: number): void {
+  prefs.speed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, s));
+  for (const t of Object.values(traces)) t.setSpeed(prefs.speed);
+}
 
 tracesEl.addEventListener('pointerdown', (e) => {
   if ((e.target as HTMLElement).closest('button')) return;
@@ -257,23 +313,22 @@ tracesEl.addEventListener('pointermove', (e) => {
   if (gesture === 'tap' && Math.hypot(p.x - p.x0, p.y - p.y0) > 8) { gesture = 'drag'; window.clearTimeout(longPress); }
   if (gesture === 'drag') {
     // Horizontal: history (both traces together, like the app). Vertical: pan when zoomed.
-    const speed = traces.sonar.speed;
+    const pxPerCol = lead().cssPerColumn;
     if (!hScroll) {
       // A live trace only starts scrolling on a clearly sideways move of 8+ columns (app: a.g()),
       // so a vertical pan with a little drift doesn't pause it.
       const ox = p.x - p.x0, oy = p.y - p.y0;
-      hScroll = !paused() ? Math.abs(ox) >= 8 * speed && Math.abs(ox) > Math.abs(oy) : true;
-      if (hScroll) colCarry = paused() ? 0 : -ox / speed;
+      hScroll = !paused() ? Math.abs(ox) >= 8 * pxPerCol && Math.abs(ox) > Math.abs(oy) : true;
+      if (hScroll) colCarry = paused() ? 0 : -ox / pxPerCol;
     } else {
-      colCarry += -dx / speed;
+      colCarry += -dx / pxPerCol;
     }
     const whole = Math.trunc(colCarry);
     if (hScroll && whole) {
       colCarry -= whole;
-      for (const t of Object.values(traces)) t.scrollBy(whole);
-      paintPause();
+      scrollHistory(whole);
     }
-    if (Math.abs(dy) > 0) for (const t of shownTraces()) t.panBy(dy);
+    if (dy) for (const t of shownTraces()) t.panBy(dy);
   } else if (gesture === 'pinch' && pointers.size === 2 && pinch0) {
     const [a, b] = [...pointers.values()];
     const sx = Math.abs(a.x - b.x), sy = Math.abs(a.y - b.y);
@@ -285,9 +340,7 @@ tracesEl.addEventListener('pointermove', (e) => {
         pinch0.dy = sy;
       }
     } else {
-      const s = Math.max(1, Math.min(5, pinch0.speed * (sx / Math.max(1, pinch0.dx))));
-      prefs.speed = s; // saved when the pinch ends
-      for (const t of Object.values(traces)) t.setSpeed(s);
+      useSpeed(pinch0.speed * (sx / Math.max(1, pinch0.dx))); // saved when the pinch ends
     }
   }
 });
@@ -322,32 +375,41 @@ function pointerEnd(e: PointerEvent): void {
 tracesEl.addEventListener('pointerup', pointerEnd);
 tracesEl.addEventListener('pointercancel', pointerEnd);
 
+/**
+ * Mouse wheel and trackpad. Ctrl + wheel or Alt + wheel: scroll speed; trackpad pinch (and plain
+ * wheel): zoom; Shift + wheel or a sideways wheel: history. A trackpad pinch reaches the page as
+ * Ctrl + wheel in pixel mode with small, usually fractional deltas; a mouse wheel with Ctrl held
+ * comes in line mode or with whole-pixel notches.
+ */
 tracesEl.addEventListener('wheel', (e) => {
   e.preventDefault();
-  if (e.ctrlKey && !e.deltaX && Math.abs(e.deltaY) < 20 && !e.altKey) {
-    // trackpad pinch arrives as ctrl+wheel with small deltas: zoom
-    zoomAll(Math.exp(-e.deltaY / 100), e.clientX, e.clientY);
+  // Deltas in CSS px whatever the browser reports them in (lines, or pages of the trace area).
+  const scale = e.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : e.deltaMode === WheelEvent.DOM_DELTA_PAGE ? Math.max(1, tracesEl.clientHeight) : 1;
+  const dx = e.deltaX * scale, dy = e.deltaY * scale;
+  const pinch = e.ctrlKey && !e.altKey && e.deltaMode === WheelEvent.DOM_DELTA_PIXEL && !e.deltaX
+    && (Math.abs(e.deltaY) < 20 || !Number.isInteger(e.deltaY));
+  if (pinch) {
+    zoomAll(Math.exp(-dy / 100), e.clientX, e.clientY);
+    for (const tr of shownTraces()) tr.endGesture();
     return;
   }
   if (e.ctrlKey || e.altKey) {
-    const s = Math.max(1, Math.min(5, prefs.speed * Math.exp(-e.deltaY / 400)));
-    savePrefs({ speed: s });
-    for (const tr of Object.values(traces)) tr.setSpeed(s);
+    useSpeed(prefs.speed * Math.exp(-dy / 400));
+    savePrefs({ speed: prefs.speed });
     return;
   }
-  const horiz = e.shiftKey ? e.deltaY : e.deltaX;
-  if (Math.abs(horiz) > Math.abs(e.shiftKey ? 0 : e.deltaY)) {
+  const horiz = e.shiftKey ? dy : dx;
+  if (Math.abs(horiz) > Math.abs(e.shiftKey ? 0 : dy)) {
     // Keep the fraction, so slow trackpad scrolling still moves.
-    wheelCarry += horiz / traces.sonar.speed;
+    wheelCarry += horiz / lead().cssPerColumn;
     const whole = Math.trunc(wheelCarry);
     if (whole) {
       wheelCarry -= whole;
-      for (const tr of Object.values(traces)) tr.scrollBy(whole);
-      paintPause();
+      scrollHistory(whole);
     }
     return;
   }
-  zoomAll(Math.exp(-e.deltaY / 500), e.clientX, e.clientY);
+  zoomAll(Math.exp(-dy / 500), e.clientX, e.clientY, true);
   for (const tr of shownTraces()) tr.endGesture();
 }, { passive: false });
 
@@ -378,35 +440,54 @@ function showDetails(x: number, y: number): void {
 // ------------------------------------------------------------------ history scrollbar (app: HistoryScrollbarView)
 
 const scrollEl = $<HTMLDivElement>('history-scroll');
-const thumb = scrollEl.querySelector<HTMLDivElement>('.thumb')!;
-/** Trace the history scrollbar follows (the first one shown). */
-function primary(): TraceView {
-  return shownTraces()[0] ?? traces.downvision;
-}
-/** Size and place the scrollbar thumb for the visible part of the primary trace's history. */
+const thumb = scrollEl.querySelector<HTMLDivElement>('.thumb') ?? (() => { throw new Error('wifish: index.html has no .thumb in #history-scroll'); })();
+let scrollPainted = '';
+/**
+ * Size and place the scrollbar thumb for the visible part of the lead trace's history and expose
+ * its position (0 = oldest, 100 = live) to assistive technology.
+ */
 function paintScrollbar(): void {
   if (scrollEl.hidden) return;
-  const t = primary();
+  const t = lead();
   const first = t.store.first, last = t.store.last;
   const total = Math.max(1, last - first + 1);
   const vis = Math.min(total, t.visibleColumns());
   const w = scrollEl.clientWidth;
   const tw = Math.max(24, (vis / total) * w);
-  const x = ((t.right - first + 1 - vis) / Math.max(1, total - vis)) * (w - tw);
+  // Thumb at the left: the oldest column fills the screen (right = first + vis - 1); at the right: live.
+  const frac = total > vis ? (t.right - (first + vis - 1)) / (total - vis) : 1;
+  const x = Math.max(0, Math.min(w - tw, frac * (w - tw) || 0));
+  const key = `${tw}:${x}`;
+  if (key === scrollPainted) return;
+  scrollPainted = key;
   thumb.style.width = `${tw}px`;
-  thumb.style.transform = `translateX(${Math.max(0, Math.min(w - tw, x || 0))}px)`;
+  thumb.style.transform = `translateX(${x}px)`;
+  const pct = String(Math.round(Math.max(0, Math.min(1, frac)) * 100));
+  if (scrollEl.getAttribute('aria-valuenow') !== pct) {
+    scrollEl.setAttribute('aria-valuenow', pct);
+    const c = t.store.get(t.right);
+    scrollEl.setAttribute('aria-valuetext', t.live || !c ? 'Live' : `Pings from ${new Date(c.t).toLocaleTimeString()}`);
+  }
+}
+/** Right-edge column of the lead trace for a thumb position `frac` (0 = oldest filling the screen, 1 = newest). */
+function scrollbarTarget(frac: number): number {
+  const t = lead();
+  const first = t.store.first, last = t.store.last;
+  const total = last - first + 1;
+  const vis = Math.min(total, t.visibleColumns());
+  // Oldest right edge that still fills the screen is first + vis - 1; the newest is last. A drag to
+  // the far right lands exactly on `last`, which is what resumes live (scrollTo treats n >= last as
+  // live); anywhere short of it stays on history, even one column away, so the picture doesn't jump
+  // back to live from a thumb that is merely near the end.
+  return Math.round(first + vis - 1 + frac * (total - vis));
 }
 scrollEl.addEventListener('pointerdown', (e) => {
   scrollEl.setPointerCapture(e.pointerId);
   /** Scroll all traces so the thumb lands under the pointer. */
   const move = (ev: PointerEvent) => {
-    const t = primary();
     const r = scrollEl.getBoundingClientRect();
     const frac = Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width));
-    const target = t.store.first + t.visibleColumns() + frac * (t.store.last - t.store.first - t.visibleColumns());
-    const delta = Math.round(target - t.right);
-    for (const tr of Object.values(traces)) tr.scrollBy(delta);
-    paintPause();
+    scrollHistoryTo(scrollbarTarget(frac));
   };
   move(e);
   scrollEl.addEventListener('pointermove', move);
@@ -420,6 +501,21 @@ scrollEl.addEventListener('pointerdown', (e) => {
   scrollEl.addEventListener('pointerup', end);
   scrollEl.addEventListener('pointercancel', end);
 });
+// Keyboard: arrows step a tenth of a screen, Page keys a screen, Home the oldest pings, End live.
+scrollEl.addEventListener('keydown', (e) => {
+  const vis = lead().visibleColumns();
+  const step = Math.max(1, Math.round(vis / 10));
+  switch (e.key) {
+    case 'ArrowLeft': case 'ArrowUp': scrollHistory(-step); break;
+    case 'ArrowRight': case 'ArrowDown': scrollHistory(step); break;
+    case 'PageUp': scrollHistory(-vis); break;
+    case 'PageDown': scrollHistory(vis); break;
+    case 'Home': scrollHistoryTo(scrollbarTarget(0)); break;
+    case 'End': scrollHistoryTo(null); break;
+    default: return;
+  }
+  e.preventDefault();
+});
 
 // ------------------------------------------------------------------ snapshot
 
@@ -430,7 +526,8 @@ btnSnapshot.addEventListener('click', () => {
   const c = document.createElement('canvas');
   c.width = Math.round(rect.width * dpr);
   c.height = Math.round(rect.height * dpr);
-  const g = c.getContext('2d')!;
+  const g = c.getContext('2d');
+  if (!g) { toast('Snapshot not available in this browser'); return; }
   g.scale(dpr, dpr);
   g.fillStyle = '#242328';
   g.fillRect(0, 0, rect.width, rect.height);
@@ -465,15 +562,15 @@ btnSnapshot.addEventListener('click', () => {
 
 let depthShownAt = 0;
 let depthTimer: number | undefined;
-/** Update the water temperature readout, and the depth at most once per second. */
-function paintDatabox(): void {
+/** Update the water temperature readout, and the depth at most once per second (`now` = at once, e.g. a new unit). */
+function paintDatabox(now = false): void {
   // The app refreshes the depth readout at most once per second.
-  const now = performance.now();
-  const wait = 1000 - (now - depthShownAt);
-  if (wait > 0) {
+  const t0 = performance.now();
+  const wait = 1000 - (t0 - depthShownAt);
+  if (wait > 0 && !now) {
     if (depthTimer === undefined) depthTimer = window.setTimeout(() => { depthTimer = undefined; paintDatabox(); }, wait);
   } else {
-    depthShownAt = now;
+    depthShownAt = t0;
     paintDepth();
   }
   const t = formatTemp(state?.waterTempCentiC ?? null, prefs.tempUnit);
@@ -565,12 +662,20 @@ function onState(s: WifishState | null): void {
     epoch = s.epoch;
   }
   const prevWifish = isWifish();
+  const prevSys = state?.system ?? null;
   state = s;
-  btnSettings.hidden = !isWifish();
-  btnViews.hidden = isWifish();
-  if (prevWifish !== isWifish()) hideGears();
+  const sys = s?.system ?? null;
+  const wifish = isWifish();
+  btnSettings.hidden = !wifish;
+  btnViews.hidden = wifish;
+  if (prevWifish !== wifish) {
+    hideGears();
+    for (const t of Object.values(traces)) t.gear.hidden = wifish; // its settings live in the toolbar
+  }
   applyView();
-  applyPrefs();
+  // The traces only care about the system settings (offset, the sonar's unit); the databox about every state.
+  if (prevSys?.transducerOffsetCm !== sys?.transducerOffsetCm || prevSys?.depthUnit !== sys?.depthUnit) applyPrefs();
+  else paintDatabox();
   paintConnection();
   for (const l of listeners) l(s);
 }
@@ -580,18 +685,24 @@ function onState(s: WifishState | null): void {
 const ctx: Ctx = {
   state: () => state,
   depthUnit,
-  /** Change a channel's settings on the plugin and take the returned state; errors are toasted and rethrown. */
+  /** Change a channel's settings on the plugin and take the returned state; an error is toasted (never thrown). */
   async sendChannel(ch, patch) {
-    try { onState(await setChannel(ch, patch)); } catch (e) { toast((e as Error).message); throw e; }
+    try { onState(await setChannel(ch, patch)); } catch (e) { toast((e as Error).message); }
   },
-  /** Change system settings on the plugin and take the returned state; errors are toasted and rethrown. */
+  /** Change system settings on the plugin and take the returned state; an error is toasted (never thrown). */
   async sendSystem(patch) {
-    try { onState(await setSystem(patch)); } catch (e) { toast((e as Error).message); throw e; }
+    try { onState(await setSystem(patch)); } catch (e) { toast((e as Error).message); }
   },
   applyPrefs: () => { applyPrefs(); applyView(); },
-  /** Use the units here at once, then save them on the plugin so every viewer and later visit gets them. */
+  /**
+   * Use the units here at once, then save them on the plugin so every viewer and later visit gets
+   * them. A changed depth unit also re-snaps the sonar's range, from this viewer only.
+   */
   setUnits(patch) {
+    const before = depthUnit();
     useUnits(patch);
+    const after = depthUnit();
+    if (after.id !== before.id) unitChanged(after);
     setDisplay(patch).catch((e) => toast(`Units not saved on the server: ${(e as Error).message}`));
   },
   vessel: () => vessel,
@@ -616,13 +727,14 @@ function useUnits(d: DisplayPrefs): void {
 
 /**
  * Units the plugin keeps for all viewers: take those picked anywhere; for any not picked
- * yet, offer the one picked earlier in this browser so it is not lost.
+ * yet, offer the one picked earlier in this browser (a pick, never a locale default) so it
+ * is not lost.
  */
 function onDisplay(d: DisplayPrefs): void {
-  useUnits(d);
   const offer: DisplayPrefs = {};
   if (d.depthUnit === undefined && storedKeys.has('depthUnit')) offer.depthUnit = prefs.depthUnit;
   if (d.tempUnit === undefined && storedKeys.has('tempUnit')) offer.tempUnit = prefs.tempUnit;
+  useUnits(d);
   if (Object.keys(offer).length) setDisplay(offer).catch(() => { /* kept in this browser */ });
 }
 
@@ -652,19 +764,21 @@ function toast(msg: string): void {
   el.textContent = msg;
   el.classList.add('shown');
   window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => el!.classList.remove('shown'), 3500);
+  toastTimer = window.setTimeout(() => el.classList.remove('shown'), 3500);
 }
 
 const stream = new PluginStream({
   state: onState,
   display: onDisplay,
   vessel: onVessel,
-  /** Store an incoming ping column and redraw its trace if it is live or zoomed. */
+  /** Store an incoming ping column and redraw its trace if it is live (a paused one shows nothing new). */
   column(c) {
-    stores[c.ch].add(c);
+    if (!isChannelName(c.ch)) return;
+    const store = stores[c.ch];
+    if (!store.add(c)) return;
     const t = traces[c.ch];
-    if (t.live || t.zoomed) t.invalidate();
-    if (backlogDone && stores[c.ch].cols.length === 1) paintConnection();
+    if (t.live) t.invalidate();
+    if (backlogDone && store.cols.length === 1) paintConnection();
   },
   /** Plugin history restarted: the next state's epoch is taken as the new run's. */
   reset() {

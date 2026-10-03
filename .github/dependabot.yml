@@ -5,3 +5,17 @@ updates:
     directory: /
     schedule:
       interval: weekly
+
+  # npm dev dependencies (typescript, vitest, esbuild, @types/node): one weekly PR
+  # for all minor and patch bumps; major bumps get a PR each.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      npm-minor-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
