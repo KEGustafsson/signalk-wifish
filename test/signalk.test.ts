@@ -55,3 +55,43 @@ test('Throttle: change, heartbeat, rate limit, null edge', () => {
   expect(t.shouldEmit('p', null, 10_400)).toBe(false);
   expect(t.shouldEmit('p', 3, 10_401)).toBe(true);
 });
+
+test('depthValues never publishes a negative depth (the app shows 0.0), offsets stay as they are', () => {
+  // Reported 20 cm with a 50 cm waterline offset: below transducer would be -30 cm.
+  expect(depthValues(20, 50)).toEqual([
+    { path: PATH.depth, value: 0 }, { path: PATH.depthBelowSurface, value: 0.2 }, { path: PATH.surfaceToTransducer, value: 0.5 },
+  ]);
+  // A negative reported depth with a keel offset: below keel 0, below transducer from the offset.
+  expect(depthValues(-20, -40)).toEqual([
+    { path: PATH.depth, value: 0.2 }, { path: PATH.depthBelowKeel, value: 0 }, { path: PATH.transducerToKeel, value: 0.4 },
+  ]);
+  expect(depthValues(-100, 0, 30)).toEqual([
+    { path: PATH.depth, value: 0 }, { path: PATH.depthBelowSurface, value: 0 }, { path: PATH.surfaceToTransducer, value: 0.3 },
+  ]);
+  expect(depthValues(-60, -40, 30)).toEqual([
+    { path: PATH.depth, value: 0 },
+    { path: PATH.depthBelowSurface, value: 0.1 }, { path: PATH.surfaceToTransducer, value: 0.3 },
+    { path: PATH.depthBelowKeel, value: 0 }, { path: PATH.transducerToKeel, value: 0.4 },
+  ]);
+  expect(depthValues(0, 0)).toEqual([{ path: PATH.depth, value: 0 }]);
+  expect(Object.is(depthValues(-1, 0)[0].value, 0)).toBe(true); // 0, not -0
+  expect(depthValues(null, -40, 30).map((v) => v.value)).toEqual([null, null, 0.3, null, 0.4]);
+});
+
+test('Throttle: a change that reverts inside the window is never sent; the heartbeat boundary is inclusive', () => {
+  const t = new Throttle({ minIntervalMs: 200, heartbeatMs: 10_000 });
+  expect(t.shouldEmit('p', 1, 0)).toBe(true);
+  expect(t.shouldEmit('p', 2, 100)).toBe(false); // too soon
+  expect(t.shouldEmit('p', 1, 150)).toBe(false); // back to what was sent
+  expect(t.shouldEmit('p', 1, 300)).toBe(false); // nothing changed since the last send
+  expect(t.shouldEmit('p', 1, 9_999)).toBe(false);
+  expect(t.shouldEmit('p', 1, 10_000)).toBe(true); // heartbeat due at exactly heartbeatMs
+  expect(t.shouldEmit('p', 1, 19_999)).toBe(false);
+  expect(t.shouldEmit('p', 1, 20_000)).toBe(true);
+  // minInterval boundary is inclusive too, and paths are independent.
+  expect(t.shouldEmit('p', 2, 20_199)).toBe(false);
+  expect(t.shouldEmit('q', 2, 20_199)).toBe(true);
+  expect(t.shouldEmit('p', 2, 20_200)).toBe(true);
+  t.reset();
+  expect(t.shouldEmit('p', 2, 20_201)).toBe(true);
+});

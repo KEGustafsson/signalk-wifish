@@ -53,3 +53,46 @@ describe('display units', () => {
     expect(s.get()).toEqual({ tempUnit: 'F' });
   });
 });
+
+describe('store logging', () => {
+  test('a save failure keeps the value in memory and goes to the error logger', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wifish-'));
+    fs.writeFileSync(path.join(dir, 'blocker'), 'a file where a directory is needed');
+    const file = path.join(dir, 'blocker', 'display.json');
+    const debugs: string[] = [], errors: string[] = [];
+    const s = new DisplayStore(() => file, { debug: (m) => debugs.push(m), error: (m) => errors.push(m) });
+    expect(s.set({ tempUnit: 'F' })).toEqual({ tempUnit: 'F' });
+    expect(s.get()).toEqual({ tempUnit: 'F' });
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatch(new RegExp(`^cannot save ${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: `));
+    expect(debugs).toEqual([]);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('unreadable JSON is an error, valid JSON with bad contents is only debug', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wifish-'));
+    const file = path.join(dir, 'display.json');
+    const debugs: string[] = [], errors: string[] = [];
+    const log = { debug: (m: string) => debugs.push(m), error: (m: string) => errors.push(m) };
+    fs.writeFileSync(file, '{"tempUnit":"K"}');
+    expect(new DisplayStore(() => file, log).get()).toEqual({});
+    expect(debugs).toEqual([`ignoring ${file}: tempUnit must be C or F`]);
+    expect(errors).toEqual([]);
+    fs.writeFileSync(file, '{"tempUnit":');
+    expect(new DisplayStore(() => file, log).get()).toEqual({});
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatch(/^cannot read /);
+    // A missing file is neither.
+    fs.rmSync(file);
+    debugs.length = errors.length = 0;
+    expect(new DisplayStore(() => file, log).get()).toEqual({});
+    expect(debugs).toEqual([]);
+    expect(errors).toEqual([]);
+    // One function serves both levels.
+    const both: string[] = [];
+    fs.writeFileSync(file, '{"tempUnit":"K"}');
+    new VesselStore(() => file, (m) => both.push(m)).get();
+    expect(both).toEqual([`ignoring ${file}: unknown field tempUnit`]);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});

@@ -3,13 +3,15 @@
 
 import { EventEmitter } from 'node:events';
 import { Sonar4Session, type SessionColumn } from './session';
-import { UNIT_TYPES, UNIT_WIFISH, ERROR_LOW_VOLTAGE, type ChannelSettings, type ChannelId } from './sonar4';
+import { UNIT_TYPES, UNIT_WIFISH, ERROR_LOW_VOLTAGE, isSonarMessage, type ChannelSettings } from './sonar4';
 import { PATH, centiCToK, depthValues, toDelta, Throttle, type Delta, type PathValue } from './signalk';
 import type { LinkState, Transport } from './transport';
 import {
-  CHANNELS, type ChannelName, type ChannelPatch, type ChannelSettingsView, type ColumnMessage, type SystemPatch,
-  type WifishState,
+  CHANNELS, CHANNEL_CODE, channelByCode, DEFAULT_HISTORY_COLUMNS, MAX_HISTORY_COLUMNS,
+  type ChannelName, type ChannelPatch, type ChannelSettingsView, type ColumnMessage, type SystemPatch, type WifishState,
 } from './shared/api';
+import { MIN_RANGE_WINDOW_CM } from './shared/units';
+import { errorMessage } from './util';
 
 export interface EngineOptions {
   /** Columns kept per channel for viewers that connect later. */
@@ -20,7 +22,10 @@ export interface EngineOptions {
   surfaceToTransducerCm?: () => number | null;
   /** Receives Signal K deltas. */
   onDelta?: (d: Delta) => void;
+  /** Diagnostics (debug level): session warnings. */
   log?: (msg: string) => void;
+  /** Failures: a datagram, link or delta handler that threw. Falls back to `log`. */
+  error?: (msg: string) => void;
 }
 
 export interface EngineEvents {
@@ -28,14 +33,20 @@ export interface EngineEvents {
   column: [ColumnMessage];
 }
 
-const NAMES: readonly ChannelName[] = CHANNELS;
 /** The app keeps showing the last depth this long after bottom lock is lost (msg 105). */
 export const DEPTH_HOLD_MS = 6000;
+/** Signal K output rates: depth at most 5 Hz with a 5 s heartbeat, water temperature at most 1 Hz with a 10 s heartbeat. */
+export const DEPTH_MIN_INTERVAL_MS = 200;
+export const DEPTH_HEARTBEAT_MS = 5000;
+export const TEMP_MIN_INTERVAL_MS = 1000;
+export const TEMP_HEARTBEAT_MS = 10_000;
+/** Readings are dropped after this long without sonar data (the watchdog ticks once a second). */
+export const STALE_MS = 5000;
 
-/** History size from (possibly hand-edited) config: finite, 0..20000, default 1500. */
-function clampColumns(v: unknown): number {
+/** History size from (possibly hand-edited) config: finite, 0..MAX_HISTORY_COLUMNS, default DEFAULT_HISTORY_COLUMNS. */
+export function clampColumns(v: unknown): number {
   const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN;
-  return Number.isFinite(n) ? Math.max(0, Math.min(20_000, Math.round(n))) : 1500;
+  return Number.isFinite(n) ? Math.max(0, Math.min(MAX_HISTORY_COLUMNS, Math.round(n))) : DEFAULT_HISTORY_COLUMNS;
 }
 /** Monotonic clock, ms. */
 const mono = () => globalThis.performance.now();
@@ -55,14 +66,15 @@ export class Engine extends EventEmitter<EngineEvents> {
   readonly epoch = `${Date.now().toString(36)}.${++engines}`;
   readonly session = new Sonar4Session();
   readonly transport: Transport;
-  #opts: Required<Omit<EngineOptions, 'onDelta' | 'log'>> & Pick<EngineOptions, 'onDelta' | 'log'>;
+  #opts: Required<Omit<EngineOptions, 'onDelta' | 'log' | 'error'>> & Pick<EngineOptions, 'onDelta' | 'log'>;
+  #error: (msg: string) => void;
   #link: LinkState = 'offline';
   #message = 'Starting';
   #history: Record<ChannelName, ColumnMessage[]> = { sonar: [], downvision: [] };
   #n: Record<ChannelName, number> = { sonar: 0, downvision: 0 };
   #throttles = {
-    depth: new Throttle({ minIntervalMs: 200, heartbeatMs: 5000 }),
-    temp: new Throttle({ minIntervalMs: 1000, heartbeatMs: 10_000 }),
+    depth: new Throttle({ minIntervalMs: DEPTH_MIN_INTERVAL_MS, heartbeatMs: DEPTH_HEARTBEAT_MS }),
+    temp: new Throttle({ minIntervalMs: TEMP_MIN_INTERVAL_MS, heartbeatMs: TEMP_HEARTBEAT_MS }),
   };
   #stateTimer: NodeJS.Timeout | null = null;
   #watchdog: NodeJS.Timeout | null = null;
@@ -90,29 +102,35 @@ export class Engine extends EventEmitter<EngineEvents> {
       onDelta: opts.onDelta,
       log: opts.log,
     };
+    this.#error = (m) => (opts.error ?? opts.log)?.(m);
     const s = this.session;
     transport.on('datagram', (b) => {
       let id: number | null = null;
       try {
         id = s.handle(b);
       } catch (e) {
-        this.#opts.log?.(`error handling a datagram: ${(e as Error).message}`);
+        this.#error(`error handling a datagram: ${errorMessage(e)}`);
       }
-      if (id !== null && id >>> 8 === 0x2701) this.#lastData = mono();
+      if (isSonarMessage(id)) this.#lastData = mono();
     });
     transport.on('link', (state, msg) => {
-      const prev = this.#link;
-      this.#link = state;
-      this.#message = msg;
-      // A new session (not a recovery from 'lost') starts from scratch, like the app's decoder reset.
-      if (state === 'searching' || state === 'offline' || (state === 'connecting' && prev !== 'lost')) {
-        s.reset();
-        this.#clearReadings();
-      } else if (state === 'lost') {
+      try {
+        const prev = this.#link;
+        this.#link = state;
+        this.#message = msg;
+        // The link change covers what the watchdog would otherwise find a few seconds later
+        // (and repeat the null readings for): data before it does not count.
+        this.#lastData = null;
+        this.#stale = false;
+        // A new session (not a recovery from 'lost') starts from scratch, like the app's decoder reset.
+        const fresh = state === 'searching' || state === 'offline' || (state === 'connecting' && prev !== 'lost');
         // The app blanks depth and water temperature when the connection drops (msg 11/12).
-        this.#clearReadings();
+        if (fresh || state === 'lost') this.#clearReadings();
+        if (fresh) s.reset();
+        this.#stateChanged(true);
+      } catch (e) {
+        this.#error(`error handling link '${state}': ${errorMessage(e)}`);
       }
-      this.#stateChanged(true);
     });
     s.on('warn', (m) => this.#opts.log?.(m));
     s.on('unit', () => this.#stateChanged());
@@ -125,12 +143,12 @@ export class Engine extends EventEmitter<EngineEvents> {
     s.on('column', (c) => this.#column(c));
   }
 
-  /** Start the stale-data watchdog and the transport; an Engine cannot be restarted after stop(). */
+  /** Start the watchdog (stale data, heartbeats, resends) and the transport; an Engine cannot be restarted after stop(). */
   start(): void {
     if (this.#running || this.#stopped) return; // listeners are gone after stop(); make a new Engine
 
     this.#running = true;
-    this.#watchdog = setInterval(() => { this.#checkStale(); this.#resendPending(); }, 1000);
+    this.#watchdog = setInterval(() => this.#tick(), 1000);
     this.transport.start();
   }
 
@@ -139,15 +157,15 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (!this.#running) return;
     this.#running = false;
     this.#stopped = true;
-    if (this.#holdTimer) clearTimeout(this.#holdTimer);
-    this.#holdTimer = null;
-    if (this.#watchdog) clearInterval(this.#watchdog);
-    if (this.#stateTimer) clearTimeout(this.#stateTimer);
-    this.#watchdog = this.#stateTimer = null;
-    this.transport.stop();
-    this.transport.removeAllListeners();
-    this.session.removeAllListeners();
-    this.removeAllListeners();
+    try {
+      this.#clearTimers();
+      this.transport.stop(); // reports 'offline', which publishes null depth and temperature
+    } finally {
+      this.#clearTimers(); // anything the stop itself scheduled
+      this.transport.removeAllListeners();
+      this.session.removeAllListeners();
+      this.removeAllListeners();
+    }
   }
 
   /** Link state last reported by the transport. */
@@ -179,8 +197,8 @@ export class Engine extends EventEmitter<EngineEvents> {
       lowVoltage: s.errorFlags !== null && (s.errorFlags & ERROR_LOW_VOLTAGE) !== 0,
       system: sys ? { transducerOffsetCm: sys.transducerOffsetCm, depthUnit: sys.depthUnit, simulator: sys.simulator } : null,
       channels: {
-        sonar: view(s.channelSettings(s.indexFor(0))),
-        downvision: view(s.channelSettings(s.indexFor(1))),
+        sonar: view(s.channelSettings(s.indexFor(CHANNEL_CODE.sonar))),
+        downvision: view(s.channelSettings(s.indexFor(CHANNEL_CODE.downvision))),
       },
       active: { sonar: this.#n.sonar > 0, downvision: this.#n.downvision > 0 },
     };
@@ -189,21 +207,21 @@ export class Engine extends EventEmitter<EngineEvents> {
   /** Apply a settings change from the UI. Returns an error message, or null when sent. */
   setChannel(ch: ChannelName, patch: ChannelPatch): string | null {
     if (!this.transport.canSend) return 'Sonar settings cannot be changed in this mode';
-    const code: ChannelId = ch === 'sonar' ? 0 : 1;
     const p = { ...patch };
+    const rangeChange = p.rangeShallowCm !== undefined || p.rangeDeepCm !== undefined;
     // Picking a Shallow or Deep preset turns Auto range off, as in the app.
-    if ((p.rangeShallowCm !== undefined || p.rangeDeepCm !== undefined) && p.rangeAuto === undefined) p.rangeAuto = false;
-    // Range goes to both channels: it must stay shallow < deep against what each one holds.
-    for (const c of [0, 1] as const) {
-      const held = this.session.channelSettings(this.session.indexFor(c));
-      if (!held) continue;
-      const shallow = p.rangeShallowCm ?? held.rangeShallowCm;
-      const deep = p.rangeDeepCm ?? held.rangeDeepCm;
-      if ((p.rangeShallowCm !== undefined || p.rangeDeepCm !== undefined) && shallow >= deep) {
-        return 'Shallow must be less than Deep';
+    if (rangeChange && p.rangeAuto === undefined) p.rangeAuto = false;
+    // Range goes to both channels: it must leave a usable window against what each one holds.
+    if (rangeChange) {
+      for (const c of CHANNELS) {
+        const held = this.session.channelSettings(this.session.indexFor(CHANNEL_CODE[c]));
+        if (!held) continue;
+        const shallow = p.rangeShallowCm ?? held.rangeShallowCm;
+        const deep = p.rangeDeepCm ?? held.rangeDeepCm;
+        if (deep - shallow < MIN_RANGE_WINDOW_CM) return `Shallow must be less than Deep by at least ${MIN_RANGE_WINDOW_CM} cm`;
       }
     }
-    const msgs = this.session.buildChannelCommands(code, p);
+    const msgs = this.session.buildChannelCommands(CHANNEL_CODE[ch], p);
     if (!msgs.length) return 'Channel settings not received from the sonar yet';
     for (const m of msgs) this.transport.send(m);
     return null;
@@ -225,6 +243,25 @@ export class Engine extends EventEmitter<EngineEvents> {
 
   // ------------------------------------------------------------------ internals
 
+  /** Cancel every timer the engine owns. */
+  #clearTimers(): void {
+    if (this.#holdTimer) clearTimeout(this.#holdTimer);
+    if (this.#watchdog) clearInterval(this.#watchdog);
+    if (this.#stateTimer) clearTimeout(this.#stateTimer);
+    this.#holdTimer = this.#watchdog = this.#stateTimer = null;
+  }
+
+  /** Once a second: drop stale readings, send due heartbeats, resend unconfirmed settings. */
+  #tick(): void {
+    try {
+      this.#checkStale();
+      this.#heartbeat();
+      this.#resendPending();
+    } catch (e) {
+      this.#error(`watchdog: ${errorMessage(e)}`);
+    }
+  }
+
   /** Emit 'state' immediately when `now`, else coalesce changes into one emit within 250 ms. */
   #stateChanged(now = false): void {
     if (now) {
@@ -233,16 +270,21 @@ export class Engine extends EventEmitter<EngineEvents> {
       this.emit('state', this.state());
       return;
     }
-    if (this.#stateTimer) return;
+    if (this.#stateTimer || this.#stopped) return;
     this.#stateTimer = setTimeout(() => {
       this.#stateTimer = null;
       this.emit('state', this.state());
     }, 250);
   }
 
-  /** Send the values as one Signal K delta, if there are any. */
+  /** Send the values as one Signal K delta, if there are any; a failing consumer is logged, not propagated. */
   #emitSk(values: PathValue[]): void {
-    if (values.length) this.#opts.onDelta?.(toDelta(values));
+    if (!values.length) return;
+    try {
+      this.#opts.onDelta?.(toDelta(values));
+    } catch (e) {
+      this.#error(`error delivering a delta: ${errorMessage(e)}`);
+    }
   }
 
   /** Publish depth paths for `cm` (throttled unless `force`), sending null for paths that no longer apply. */
@@ -273,14 +315,26 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (this.#throttles.temp.shouldEmit(PATH.waterTemp, value, mono())) this.#emitSk([{ path: PATH.waterTemp, value }]);
   }
 
-  /** Watchdog: clear readings once no sonar data has arrived for 5 s. */
+  /** Watchdog: clear readings once no sonar data has arrived for STALE_MS. */
   #checkStale(): void {
-    const quiet = this.#lastData !== null && mono() - this.#lastData > 5000;
+    const quiet = this.#lastData !== null && mono() - this.#lastData > STALE_MS;
     if (quiet && !this.#stale) {
       this.#clearReadings();
       this.#stateChanged(true);
     }
     this.#stale = quiet;
+  }
+
+  /**
+   * Heartbeats are timer-driven: the held readings go through the throttles again so a due
+   * heartbeat (or a change minInterval suppressed) is sent even when no new sample arrives.
+   * Nothing is re-fed while stale or without readings: null is sent once, not repeated.
+   */
+  #heartbeat(): void {
+    if (this.#stale) return;
+    const s = this.session;
+    if (s.bottomCm !== null) this.#depth(s.bottomCm);
+    if (s.waterTempCentiC !== null) this.#temperature(s.waterTempCentiC);
   }
 
   /** Send settings changes the sonar has not confirmed yet again (UDP may have dropped them). */
@@ -289,11 +343,15 @@ export class Engine extends EventEmitter<EngineEvents> {
     for (const m of this.session.retryPending()) this.transport.send(m);
   }
 
-  /** No trustworthy readings any more: publish null depth and temperature, blank the display. */
+  /**
+   * No trustworthy readings any more: publish null depth and temperature, blank the display.
+   * Depth paths already at null stay as they are (no forced repeat).
+   */
   #clearReadings(): void {
     const s = this.session;
-    if (s.bottomCm !== null || this.#depthPaths.size) { s.bottomCm = null; this.#depth(null, true); }
-    if (s.waterTempCentiC !== null) { s.waterTempCentiC = null; }
+    const hadDepth = s.bottomCm !== null;
+    s.clearReadings();
+    if (hadDepth) this.#depth(null, true);
     this.#temperature(null);
     if (this.#holdTimer) clearTimeout(this.#holdTimer);
     this.#holdTimer = null;
@@ -309,7 +367,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       this.#stateChanged();
       return;
     }
-    if (this.#holdTimer || this.#shownDepthCm === null) return;
+    if (this.#holdTimer || this.#shownDepthCm === null || this.#stopped) return;
     this.#holdTimer = setTimeout(() => {
       this.#holdTimer = null;
       this.#shownDepthCm = null;
@@ -319,7 +377,7 @@ export class Engine extends EventEmitter<EngineEvents> {
 
   /** Turn a session column into a ColumnMessage, append it to the channel's capped history and emit it. */
   #column(c: SessionColumn): void {
-    const ch = NAMES[c.channel];
+    const ch = channelByCode(c.channel);
     const offset = this.session.deviceSystem?.transducerOffsetCm ?? 0;
     const bottom = this.session.bottomCm;
     const msg: ColumnMessage = {

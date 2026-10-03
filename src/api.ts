@@ -9,22 +9,46 @@
 //   POST api/display           DisplayPrefs patch
 //   GET  api/vessel            VesselSettings (waterline-to-transducer distance)
 //   POST api/vessel            VesselSettings patch
+//
+// Under Signal K the GETs are registered for readonly users and the POSTs for readwrite
+// users (plugin.ts). A readonly principal that still reaches a POST (a server without
+// per-route plugin access) gets 403, and sees canControl false in every state it is sent.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Engine } from './engine';
 import { DisplayStore, VesselStore, parseDisplayPatch, parseVesselPatch } from './store';
-import { CHANNELS, type ChannelName, type ChannelPatch, type ColumnMessage, type SystemPatch, type WifishState } from './shared/api';
+import { CHANNELS, isChannelName, type ChannelName, type ChannelPatch, type ColumnMessage, type SystemPatch, type WifishState } from './shared/api';
+import { MAX_RANGE_CM, MAX_TRANSDUCER_OFFSET_CM, MIN_RANGE_WINDOW_CM } from './shared/units';
+import { errorMessage } from './util';
 
-type Req = IncomingMessage & { body?: unknown };
+/** Authentication the Signal K server attaches to a request (its SKRequest); absent stand-alone. */
+interface SKRequest {
+  skIsAuthenticated?: boolean;
+  skPrincipal?: { identifier?: string; permissions?: string };
+}
+type Req = IncomingMessage & SKRequest & { body?: unknown };
+type Res = ServerResponse & { flush?: () => void };
 
 /**
  * Live data a viewer may leave unread before it is dropped (it reconnects after
- * `retry` and gets a fresh backlog). Counted on top of its initial backlog.
+ * `retry` and gets a fresh backlog).
  */
 export const MAX_UNREAD_BYTES = 4 * 1024 * 1024;
-/** Concurrent event streams; each holds a copy of the backlog while it drains. */
+/** Concurrent event streams. */
 export const MAX_STREAMS = 16;
-type Res = ServerResponse & { flush?: () => void };
+/** History a new viewer gets, as bytes of SSE frames, newest columns first (about 1500 full columns). */
+export const MAX_BACKLOG_BYTES = 2 * 1024 * 1024;
+/**
+ * Largest JSON request body. Under Signal K the body arrives already parsed by the server's
+ * bodyParser.json (10 MB limit), so the streaming check in readBody only applies stand-alone;
+ * the Content-Length check in handle() applies in both modes.
+ */
+export const MAX_BODY_BYTES = 16 * 1024;
+/** SSE comment keeping idle streams alive through proxies. */
+const PING_MS = 15_000;
+
+/** The Signal K principal may look but not change anything. */
+const isReadonly = (req: Req): boolean => req.skIsAuthenticated === true && req.skPrincipal?.permissions === 'readonly';
 
 /** Send a JSON response with the given status, marked uncacheable. */
 function sendJson(res: Res, status: number, body: unknown): void {
@@ -33,8 +57,17 @@ function sendJson(res: Res, status: number, body: unknown): void {
   res.setHeader('Cache-Control', 'no-store');
   res.end(JSON.stringify(body));
 }
+/** sendJson for handle(): the request was ours. */
+function reply(res: Res, status: number, body: unknown): true {
+  sendJson(res, status, body);
+  return true;
+}
 
-/** Parse the JSON request body (or reuse the server's already-parsed one); rejects bodies over 16 KiB. */
+class BodyTooLarge extends Error {
+  constructor() { super(`body larger than ${MAX_BODY_BYTES} bytes`); }
+}
+
+/** Parse the JSON request body (or reuse the server's already-parsed one); rejects bodies over MAX_BODY_BYTES. */
 async function readBody(req: Req): Promise<unknown> {
   // Already consumed and parsed by the server's body parser.
   if (req.body !== undefined && req.readableEnded) return req.body;
@@ -42,158 +75,219 @@ async function readBody(req: Req): Promise<unknown> {
   let size = 0;
   for await (const c of req) {
     size += (c as Buffer).length;
-    if (size > 16_384) throw new Error('body too large');
+    if (size > MAX_BODY_BYTES) throw new BodyTooLarge();
     chunks.push(c as Buffer);
   }
   const text = Buffer.concat(chunks).toString('utf8');
   return text ? JSON.parse(text) : {};
 }
 
+const isObject = (b: unknown): b is Record<string, unknown> => !!b && typeof b === 'object' && !Array.isArray(b);
+/** Finite number within [lo, hi]. */
+const isNum = (v: unknown, lo: number, hi: number): v is number => typeof v === 'number' && Number.isFinite(v) && v >= lo && v <= hi;
+
 const BOOL_KEYS = ['rangeAuto', 'gainAuto', 'contrastAuto', 'noiseFilterAuto'] as const;
 const PCT_KEYS = ['gain', 'contrast', 'noiseFilter'] as const;
 const CM_KEYS = ['rangeShallowCm', 'rangeDeepCm'] as const;
+const CHANNEL_KEYS: ReadonlySet<string> = new Set([...BOOL_KEYS, ...PCT_KEYS, ...CM_KEYS]);
 
 /** Validated channel patch, or an error string. */
 export function parseChannelPatch(body: unknown): ChannelPatch | string {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return 'expected a JSON object';
-  const b = body as Record<string, unknown>;
+  if (!isObject(body)) return 'expected a JSON object';
+  for (const k of Object.keys(body)) if (!CHANNEL_KEYS.has(k)) return `unknown field ${k}`;
   const out: ChannelPatch = {};
-  for (const k of Object.keys(b)) {
-    if ((BOOL_KEYS as readonly string[]).includes(k)) {
-      if (typeof b[k] !== 'boolean') return `${k} must be boolean`;
-      (out as Record<string, unknown>)[k] = b[k];
-    } else if ((PCT_KEYS as readonly string[]).includes(k)) {
-      const v = b[k];
-      if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 100) return `${k} must be 0..100`;
-      (out as Record<string, unknown>)[k] = Math.round(v);
-    } else if ((CM_KEYS as readonly string[]).includes(k)) {
-      const v = b[k];
-      if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 100_000) return `${k} must be 0..100000 cm`;
-      (out as Record<string, unknown>)[k] = Math.round(v);
-    } else {
-      return `unknown field ${k}`;
-    }
+  for (const k of BOOL_KEYS) {
+    if (!(k in body)) continue;
+    const v = body[k];
+    if (typeof v !== 'boolean') return `${k} must be boolean`;
+    out[k] = v;
   }
-  if (out.rangeShallowCm !== undefined && out.rangeDeepCm !== undefined && out.rangeShallowCm >= out.rangeDeepCm) {
-    return 'rangeShallowCm must be less than rangeDeepCm';
+  for (const k of PCT_KEYS) {
+    if (!(k in body)) continue;
+    const v = body[k];
+    if (!isNum(v, 0, 100)) return `${k} must be 0..100`;
+    out[k] = Math.round(v);
+  }
+  for (const k of CM_KEYS) {
+    if (!(k in body)) continue;
+    const v = body[k];
+    if (!isNum(v, 0, MAX_RANGE_CM)) return `${k} must be 0..${MAX_RANGE_CM} cm`;
+    out[k] = Math.round(v);
+  }
+  if (out.rangeShallowCm !== undefined && out.rangeDeepCm !== undefined && out.rangeDeepCm - out.rangeShallowCm < MIN_RANGE_WINDOW_CM) {
+    return `rangeShallowCm must be less than rangeDeepCm by at least ${MIN_RANGE_WINDOW_CM} cm`;
   }
   return Object.keys(out).length ? out : 'empty patch';
 }
 
+const SYSTEM_KEYS: ReadonlySet<string> = new Set(['transducerOffsetCm', 'simulator']);
+
 /** Validated system patch, or an error string. */
 export function parseSystemPatch(body: unknown): SystemPatch | string {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return 'expected a JSON object';
-  const b = body as Record<string, unknown>;
+  if (!isObject(body)) return 'expected a JSON object';
+  for (const k of Object.keys(body)) if (!SYSTEM_KEYS.has(k)) return `unknown field ${k}`;
   const out: SystemPatch = {};
-  for (const k of Object.keys(b)) {
-    if (k === 'simulator') {
-      if (typeof b[k] !== 'boolean') return 'simulator must be boolean';
-      out.simulator = b[k] as boolean;
-    } else if (k === 'transducerOffsetCm') {
-      const v = b[k];
-      if (typeof v !== 'number' || !Number.isFinite(v) || Math.abs(v) > 300) return 'transducerOffsetCm must be -300..300';
-      out.transducerOffsetCm = Math.round(v);
-    } else {
-      return `unknown field ${k}`;
-    }
+  if ('simulator' in body) {
+    const v = body.simulator;
+    if (typeof v !== 'boolean') return 'simulator must be boolean';
+    out.simulator = v;
+  }
+  if ('transducerOffsetCm' in body) {
+    const v = body.transducerOffsetCm;
+    if (!isNum(v, -MAX_TRANSDUCER_OFFSET_CM, MAX_TRANSDUCER_OFFSET_CM)) return `transducerOffsetCm must be -${MAX_TRANSDUCER_OFFSET_CM}..${MAX_TRANSDUCER_OFFSET_CM}`;
+    out.transducerOffsetCm = Math.round(v);
   }
   return Object.keys(out).length ? out : 'empty patch';
+}
+
+/** Channel named in an `/api/channel/<name>` path, or null for any other path. */
+function channelRoute(path: string): ChannelName | null {
+  const m = /^\/api\/channel\/([^/]+)$/.exec(path);
+  const ch = m?.[1];
+  return isChannelName(ch) ? ch : null;
+}
+
+/** One SSE frame. */
+const frame = (event: string, data: unknown): string => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+const LIVE_FRAME = frame('live', null);
+/** Column frames, serialised once however many viewers receive them (now or from the backlog). */
+const colFrames = new WeakMap<ColumnMessage, string>();
+/** SSE frame for a column. */
+function colFrame(c: ColumnMessage): string {
+  let f = colFrames.get(c);
+  if (f === undefined) {
+    f = frame('col', c);
+    colFrames.set(c, f);
+  }
+  return f;
 }
 
 /** Interleave both channels' backlogs by time so the viewer rebuilds history in order. */
 export function backlog(engine: Pick<Engine, 'history'>): ColumnMessage[] {
-  const all = CHANNELS.flatMap((c) => engine.history(c));
-  return all.sort((a, b) => a.t - b.t);
+  return CHANNELS.flatMap((c) => engine.history(c)).sort((a, b) => a.t - b.t);
+}
+
+/** Frames of the newest backlog columns that fit in `maxBytes`, oldest first. */
+export function backlogFrames(engine: Pick<Engine, 'history'>, maxBytes = MAX_BACKLOG_BYTES): string[] {
+  const cols = backlog(engine);
+  const out: string[] = [];
+  let bytes = 0;
+  for (let i = cols.length - 1; i >= 0; i--) {
+    const f = colFrame(cols[i]);
+    bytes += f.length; // JSON of a column is ASCII: one byte per char
+    if (bytes > maxBytes) break;
+    out.push(f);
+  }
+  return out.reverse();
+}
+
+/** One connected event stream. */
+interface Client {
+  res: Res;
+  /** Signal K readonly principal: every state it gets says canControl false. */
+  readonly: boolean;
+  /** Live frames held back while the backlog drains, so columns stay in order; null once live. */
+  queue: string[] | null;
+  /** Bytes in `queue`. */
+  queued: number;
+  ping: NodeJS.Timeout | null;
+}
+
+export interface ApiOptions {
+  /** Where failures are reported (a handler that threw, a stream that failed). */
+  error?: (msg: string) => void;
 }
 
 export class Api {
   #engine: () => Engine | null;
-  /** Connected viewers and how many buffered bytes each may have before it is dropped. */
-  #clients = new Map<Res, number>();
+  #clients = new Map<Res, Client>();
   #unsub: (() => void) | null = null;
   #bound: Engine | null = null;
   #display: DisplayStore;
   #vessel: VesselStore;
+  #error: (msg: string) => void;
 
   /**
    * `engine` is a getter so the plugin can swap engines on restart; `display` keeps the
    * viewers' units and `vessel` the waterline-to-transducer distance.
    */
-  constructor(engine: () => Engine | null, display = new DisplayStore(), vessel = new VesselStore()) {
+  constructor(engine: () => Engine | null, display = new DisplayStore(), vessel = new VesselStore(), opts: ApiOptions = {}) {
     this.#engine = engine;
     this.#display = display;
     this.#vessel = vessel;
+    this.#error = opts.error ?? (() => {});
   }
 
   /** Route a request whose path is relative to the plugin root. Returns false when not ours. */
   async handle(req: Req, res: Res, path: string): Promise<boolean> {
     const method = req.method ?? 'GET';
-    if (method === 'GET' && path === '/api/state') {
-      const engine = this.#engine();
-      if (!engine) sendJson(res, 503, { error: 'plugin not running' });
-      else sendJson(res, 200, engine.state());
-      return true;
+    if (method === 'GET') {
+      switch (path) {
+        case '/api/state': {
+          const engine = this.#engine();
+          return engine ? reply(res, 200, this.#stateFor(engine, isReadonly(req))) : reply(res, 503, { error: 'plugin not running' });
+        }
+        case '/api/display': return reply(res, 200, this.#display.get());
+        case '/api/vessel': return reply(res, 200, this.#vessel.get());
+        case '/api/stream':
+          if (this.#clients.size >= MAX_STREAMS) return reply(res, 503, { error: 'too many viewers' });
+          this.#stream(req, res);
+          return true;
+        default: return false;
+      }
     }
-    if (method === 'GET' && path === '/api/display') {
-      sendJson(res, 200, this.#display.get());
-      return true;
-    }
-    if (method === 'GET' && path === '/api/vessel') {
-      sendJson(res, 200, this.#vessel.get());
-      return true;
-    }
-    if (method === 'GET' && path === '/api/stream') {
-      if (this.#clients.size >= MAX_STREAMS) return sendJson(res, 503, { error: 'too many viewers' }), true;
-      this.#stream(req, res);
-      return true;
-    }
-    const m = /^\/api\/channel\/(sonar|downvision)$/.exec(path);
-    if (method !== 'POST' || (!m && path !== '/api/system' && path !== '/api/display' && path !== '/api/vessel')) return false;
+    const channel = channelRoute(path);
+    if (method !== 'POST' || (!channel && path !== '/api/system' && path !== '/api/display' && path !== '/api/vessel')) return false;
+    // Servers without per-route plugin access let a readonly user reach the POSTs.
+    if (isReadonly(req)) return reply(res, 403, { error: 'read-only access' });
     // JSON only: a cross-site form or text/plain POST (no CORS preflight) must not reach the sonar.
     if (!/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))) {
-      return sendJson(res, 415, { error: 'Content-Type must be application/json' }), true;
+      return reply(res, 415, { error: 'Content-Type must be application/json' });
     }
+    // Declared size first, so an oversized body is refused in both the streaming and the pre-parsed mode.
+    if (Number(req.headers['content-length']) > MAX_BODY_BYTES) return reply(res, 413, { error: `body larger than ${MAX_BODY_BYTES} bytes` });
     let body: unknown;
     try {
       body = await readBody(req);
     } catch (e) {
-      return sendJson(res, 400, { error: e instanceof SyntaxError ? 'invalid JSON' : (e as Error).message }), true;
+      if (e instanceof BodyTooLarge) return reply(res, 413, { error: e.message });
+      return reply(res, 400, { error: e instanceof SyntaxError ? 'invalid JSON' : errorMessage(e) });
     }
-    if (path === '/api/display') {
-      // Display units belong to the viewers, not the sonar: kept even while the plugin is stopped.
-      const patch = parseDisplayPatch(body);
-      if (typeof patch === 'string') return sendJson(res, 400, { error: patch }), true;
-      const d = this.#display.set(patch);
-      this.#broadcast('display', d);
-      return sendJson(res, 200, d), true;
-    }
-    if (path === '/api/vessel') {
-      // Kept while the plugin is stopped too; a running engine republishes depth with it.
-      const patch = parseVesselPatch(body);
-      if (typeof patch === 'string') return sendJson(res, 400, { error: patch }), true;
-      const v = this.#vessel.set(patch);
-      this.#engine()?.vesselChanged();
-      this.#broadcast('vessel', v);
-      return sendJson(res, 200, v), true;
-    }
-    const engine = this.#engine(); // read after the body: the plugin may have restarted meanwhile
-    if (!engine) return sendJson(res, 503, { error: 'plugin not running' }), true;
     try {
+      if (path === '/api/display') {
+        // Display units belong to the viewers, not the sonar: kept even while the plugin is stopped.
+        const patch = parseDisplayPatch(body);
+        if (typeof patch === 'string') return reply(res, 400, { error: patch });
+        const d = this.#display.set(patch);
+        this.#broadcast('display', d);
+        return reply(res, 200, d);
+      }
+      if (path === '/api/vessel') {
+        // Kept while the plugin is stopped too; a running engine republishes depth with it.
+        const patch = parseVesselPatch(body);
+        if (typeof patch === 'string') return reply(res, 400, { error: patch });
+        const v = this.#vessel.set(patch);
+        this.#engine()?.vesselChanged();
+        this.#broadcast('vessel', v);
+        return reply(res, 200, v);
+      }
+      const engine = this.#engine(); // read after the body: the plugin may have restarted meanwhile
+      if (!engine) return reply(res, 503, { error: 'plugin not running' });
       let err: string | null;
-      if (m) {
+      if (channel) {
         const patch = parseChannelPatch(body);
-        if (typeof patch === 'string') return sendJson(res, 400, { error: patch }), true;
-        err = engine.setChannel(m[1] as ChannelName, patch);
+        if (typeof patch === 'string') return reply(res, 400, { error: patch });
+        err = engine.setChannel(channel, patch);
       } else {
         const patch = parseSystemPatch(body);
-        if (typeof patch === 'string') return sendJson(res, 400, { error: patch }), true;
+        if (typeof patch === 'string') return reply(res, 400, { error: patch });
         err = engine.setSystem(patch);
       }
-      sendJson(res, err ? 409 : 200, err ? { error: err } : engine.state());
-    } catch {
-      sendJson(res, 500, { error: 'internal error' });
+      return err ? reply(res, 409, { error: err }) : reply(res, 200, engine.state());
+    } catch (e) {
+      this.#error(`${method} ${path}: ${errorMessage(e)}`);
+      return reply(res, 500, { error: 'internal error' });
     }
-    return true;
   }
 
   /** Call after the engine was (re)created so live events reach connected viewers. */
@@ -223,11 +317,26 @@ export class Api {
     this.#unsub?.();
     this.#unsub = null;
     this.#bound = null;
-    for (const c of this.#clients.keys()) c.end();
-    this.#clients.clear();
+    for (const c of [...this.#clients.values()]) {
+      this.#forget(c);
+      c.res.end();
+    }
   }
 
-  /** Open an SSE stream: display units, current state, vessel settings, the column backlog, a 'live' marker, then live events and pings. */
+  /** Number of connected event streams. */
+  get streams(): number { return this.#clients.size; }
+
+  /** The engine's state as this viewer may see it. */
+  #stateFor(engine: Engine, readonly: boolean): WifishState {
+    const s = engine.state();
+    return readonly ? { ...s, canControl: false } : s;
+  }
+
+  /**
+   * Open an SSE stream: display units, current state, vessel settings, the column backlog
+   * (newest MAX_BACKLOG_BYTES, written as the client takes it), live events that arrived
+   * meanwhile, a 'live' marker, then live events and pings.
+   */
   #stream(req: Req, res: Res): void {
     res.statusCode = 200;
     res.setHeader('Content-Type', 'text/event-stream');
@@ -235,39 +344,104 @@ export class Api {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
-    res.write('retry: 2000\n\n');
-    const engine = this.#engine();
-    this.#write(res, 'display', this.#display.get());
-    this.#write(res, 'state', engine ? engine.state() : null);
-    this.#write(res, 'vessel', this.#vessel.get());
-    if (engine) for (const c of backlog(engine)) this.#write(res, 'col', c);
-    this.#write(res, 'live', null);
-    this.#clients.set(res, res.writableLength + MAX_UNREAD_BYTES);
-    const ping = setInterval(() => { if (!res.destroyed) { res.write(': ping\n\n'); res.flush?.(); } }, 15_000);
-    /** Stop pinging and forget the viewer once its connection closes. */
-    const done = () => { clearInterval(ping); this.#clients.delete(res); };
+    const client: Client = { res, readonly: isReadonly(req), queue: [], queued: 0, ping: null };
+    this.#clients.set(res, client);
+    /** Forget the viewer once its connection closes. */
+    const done = () => this.#forget(client);
     req.on('close', done);
     res.on('close', done);
+    const engine = this.#engine();
+    const head = [
+      'retry: 2000\n\n',
+      frame('display', this.#display.get()),
+      frame('state', engine ? this.#stateFor(engine, client.readonly) : null),
+      frame('vessel', this.#vessel.get()),
+      ...(engine ? backlogFrames(engine) : []),
+    ];
+    this.#open(client, head).catch((e) => {
+      this.#error(`event stream: ${errorMessage(e)}`);
+      this.#drop(client);
+    });
   }
 
-  /** Write one SSE event and flush it past any compression buffering. */
-  #write(res: Res, event: string, data: unknown): void {
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  /** Write the opening frames with backpressure, then what queued up meanwhile, then go live. */
+  async #open(client: Client, head: string[]): Promise<void> {
+    if (!(await this.#drain(client, head))) return;
+    while (client.queue && client.queue.length) {
+      const q = client.queue;
+      client.queue = [];
+      client.queued = 0;
+      if (!(await this.#drain(client, q))) return;
+    }
+    client.queue = null;
+    client.res.write(LIVE_FRAME);
+    client.res.flush?.();
+    client.ping = setInterval(() => this.#ping(client), PING_MS);
+  }
+
+  /** Write frames one by one, waiting for 'drain' when the socket is full. False once the viewer is gone. */
+  async #drain(client: Client, frames: string[]): Promise<boolean> {
+    const { res } = client;
+    for (const f of frames) {
+      if (!this.#alive(client)) return false;
+      if (!res.write(f)) {
+        res.flush?.();
+        await new Promise<void>((resolve) => {
+          const once = () => { res.off('drain', once); res.off('close', once); res.off('error', once); resolve(); };
+          res.on('drain', once);
+          res.on('close', once);
+          res.on('error', once);
+        });
+      }
+    }
     res.flush?.(); // compression middleware buffers otherwise
+    return this.#alive(client);
+  }
+
+  /** Still registered and writable. */
+  #alive(client: Client): boolean {
+    return this.#clients.has(client.res) && !client.res.destroyed && !client.res.writableEnded;
+  }
+
+  /** Keepalive comment every PING_MS; a viewer that is gone or has stopped reading is dropped instead. */
+  #ping(client: Client): void {
+    if (!this.#alive(client)) return this.#forget(client);
+    if (client.res.writableLength > MAX_UNREAD_BYTES) return this.#drop(client);
+    client.res.write(': ping\n\n');
+    client.res.flush?.();
+  }
+
+  /** Stop pinging and forget the viewer. */
+  #forget(client: Client): void {
+    if (client.ping) clearInterval(client.ping);
+    client.ping = null;
+    this.#clients.delete(client.res);
+  }
+
+  /** Forget the viewer and cut its connection (it reconnects after `retry` and gets a fresh backlog). */
+  #drop(client: Client): void {
+    this.#forget(client);
+    client.res.destroy();
   }
 
   /** Send an event to every viewer, dropping any whose unread output exceeds its budget. */
   #broadcast(event: string, data: unknown): void {
-    for (const [c, budget] of this.#clients) {
+    if (!this.#clients.size) return;
+    const f = event === 'col' ? colFrame(data as ColumnMessage) : frame(event, data);
+    /** The same state for readonly viewers, built once if any needs it. */
+    let ro: string | null = null;
+    for (const c of [...this.#clients.values()]) {
+      if (!this.#alive(c)) { this.#forget(c); continue; }
       // A viewer that stopped reading (stalled proxy, suspended tab) would buffer forever.
-      if (c.writableLength > budget) {
-        this.#clients.delete(c);
-        c.destroy();
+      if (c.res.writableLength + c.queued > MAX_UNREAD_BYTES) { this.#drop(c); continue; }
+      const out = event === 'state' && c.readonly && data ? (ro ??= frame('state', { ...(data as WifishState), canControl: false })) : f;
+      if (c.queue) {
+        c.queue.push(out);
+        c.queued += out.length;
         continue;
       }
-      // Once its backlog has drained, hold it to the plain limit.
-      if (c.writableLength < MAX_UNREAD_BYTES && budget > MAX_UNREAD_BYTES) this.#clients.set(c, MAX_UNREAD_BYTES);
-      this.#write(c, event, data);
+      c.res.write(out);
+      c.res.flush?.();
     }
   }
 }

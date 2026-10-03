@@ -5,8 +5,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { DisplayPrefs, VesselSettings } from './shared/api';
-
-const DEPTH_UNIT_IDS: readonly unknown[] = ['ft', 'm', 'fa'];
+import { DEPTH_UNIT_IDS, TEMP_UNITS, isDepthUnitId, isTempUnit, MAX_TRANSDUCER_OFFSET_CM } from './shared/units';
+import { errorMessage } from './util';
 
 /** Validated display patch, or an error string. */
 export function parseDisplayPatch(body: unknown): DisplayPrefs | string {
@@ -14,12 +14,13 @@ export function parseDisplayPatch(body: unknown): DisplayPrefs | string {
   const b = body as Record<string, unknown>;
   const out: DisplayPrefs = {};
   for (const k of Object.keys(b)) {
+    const v = b[k];
     if (k === 'depthUnit') {
-      if (b[k] !== null && !DEPTH_UNIT_IDS.includes(b[k])) return 'depthUnit must be ft, m, fa or null';
-      out.depthUnit = b[k] as DisplayPrefs['depthUnit'];
+      if (v !== null && !isDepthUnitId(v)) return `depthUnit must be ${DEPTH_UNIT_IDS.join(', ')} or null`;
+      out.depthUnit = v;
     } else if (k === 'tempUnit') {
-      if (b[k] !== 'C' && b[k] !== 'F') return 'tempUnit must be C or F';
-      out.tempUnit = b[k] as DisplayPrefs['tempUnit'];
+      if (!isTempUnit(v)) return `tempUnit must be ${TEMP_UNITS.join(' or ')}`;
+      out.tempUnit = v;
     } else {
       return `unknown field ${k}`;
     }
@@ -28,7 +29,7 @@ export function parseDisplayPatch(body: unknown): DisplayPrefs | string {
 }
 
 /** Largest waterline-to-transducer distance, cm: the same limit the sonar puts on its own offset. */
-export const MAX_SURFACE_TO_TRANSDUCER_CM = 300;
+export const MAX_SURFACE_TO_TRANSDUCER_CM = MAX_TRANSDUCER_OFFSET_CM;
 
 /** Validated vessel settings patch, or an error string. */
 export function parseVesselPatch(body: unknown): VesselSettings | string {
@@ -49,11 +50,20 @@ export function parseVesselPatch(body: unknown): VesselSettings | string {
   return Object.keys(out).length ? out : 'empty patch';
 }
 
+type LogFn = (msg: string) => void;
+/**
+ * Where a store reports: `error` for a file that cannot be read or saved (the setting
+ * still applies in memory), `debug` for a file whose contents are ignored. A single
+ * function is used for both.
+ */
+export interface StoreLog { debug?: LogFn; error?: LogFn }
+
 /** One JSON file of settings, validated with `parse` on load. */
 export class JsonStore<T extends object> {
   #parse: (body: unknown) => T | string;
   #file: () => string | undefined;
-  #log: (m: string) => void;
+  #debug: LogFn;
+  #error: LogFn;
   #prefs: T | null = null;
 
   /**
@@ -61,10 +71,12 @@ export class JsonStore<T extends object> {
    * plugin's data directory only after the plugin is constructed); undefined keeps the
    * choice in memory only.
    */
-  constructor(parse: (body: unknown) => T | string, file: () => string | undefined = () => undefined, log: (m: string) => void = () => {}) {
+  constructor(parse: (body: unknown) => T | string, file: () => string | undefined = () => undefined, log: StoreLog | LogFn = {}) {
     this.#parse = parse;
     this.#file = file;
-    this.#log = log;
+    const l = typeof log === 'function' ? { debug: log, error: log } : log;
+    this.#debug = l.debug ?? (() => {});
+    this.#error = l.error ?? this.#debug;
   }
 
   /** The settings picked so far, read from the file on first use. */
@@ -75,10 +87,11 @@ export class JsonStore<T extends object> {
       if (f) {
         try {
           const p = this.#parse(JSON.parse(fs.readFileSync(f, 'utf8')));
-          if (typeof p === 'string') this.#log(`ignoring ${f}: ${p}`);
+          if (typeof p === 'string') this.#debug(`ignoring ${f}: ${p}`);
           else this.#prefs = p;
         } catch (e) {
-          if ((e as NodeJS.ErrnoException).code !== 'ENOENT') this.#log(`cannot read ${f}: ${(e as Error).message}`);
+          const code = (e as NodeJS.ErrnoException).code;
+          if (code !== 'ENOENT' && code !== 'ENOTDIR') this.#error(`cannot read ${f}: ${errorMessage(e)}`); // no file yet is normal
         }
       }
     }
@@ -97,7 +110,7 @@ export class JsonStore<T extends object> {
         fs.writeFileSync(tmp, JSON.stringify(next));
         fs.renameSync(tmp, f); // never leave a half-written file behind
       } catch (e) {
-        this.#log(`cannot save ${f}: ${(e as Error).message}`);
+        this.#error(`cannot save ${f}: ${errorMessage(e)}`);
       }
     }
     return { ...next };
@@ -111,14 +124,14 @@ export class JsonStore<T extends object> {
 
 /** The web app's display units. */
 export class DisplayStore extends JsonStore<DisplayPrefs> {
-  constructor(file?: () => string | undefined, log?: (m: string) => void) {
+  constructor(file?: () => string | undefined, log?: StoreLog | LogFn) {
     super(parseDisplayPatch, file, log);
   }
 }
 
 /** Vessel settings the sonar does not hold (the waterline-to-transducer distance). */
 export class VesselStore extends JsonStore<VesselSettings> {
-  constructor(file?: () => string | undefined, log?: (m: string) => void) {
+  constructor(file?: () => string | undefined, log?: StoreLog | LogFn) {
     super(parseVesselPatch, file, log);
   }
 }
