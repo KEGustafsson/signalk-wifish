@@ -138,8 +138,13 @@ describe('plugin HTTP API (demo source)', () => {
     ctrl.abort();
     const events = [...text.matchAll(/^event: (\w+)$/gm)].map((m) => m[1]);
     expect(events.slice(0, 3)).toEqual(['display', 'state', 'vessel']);
-    expect(events.filter((e) => e === 'col').length).toBeGreaterThan(5);
-    expect(events.at(-1)).toBe('live');
+    // One read can carry "live" and the live columns that follow it (the demo pings at 12 Hz),
+    // so check the order up to the first "live": only the backlog and the live events that were
+    // queued while it drained (columns and states) come before it.
+    const live = events.indexOf('live');
+    const beforeLive = events.slice(3, live);
+    expect(beforeLive.filter((e) => e === 'col').length).toBeGreaterThan(5);
+    expect(beforeLive.every((e) => e === 'col' || e === 'state')).toBe(true);
     expect(deltas.length).toBeGreaterThan(0);
   });
 
@@ -220,8 +225,16 @@ describe('plugin HTTP API (demo source)', () => {
   test('a replay cannot be controlled: canControl false and 409 on settings', async () => {
     const file = captureFile();
     const { base } = await startPlugin({ source: 'replay', replayFile: file });
-    let s: { link: string; canControl: boolean } = { link: '', canControl: true };
-    await until(() => { void fetch(`${base}/api/state`).then((r) => r.json()).then((j) => { s = j; }); return s.link === 'connected'; });
+    // Poll with one awaited request at a time: a fire-and-forget fetch still in flight when the
+    // test server closes rejects unhandled (ECONNRESET on macOS) and fails the run.
+    const state = async (): Promise<{ link: string; canControl: boolean }> => (await fetch(`${base}/api/state`)).json();
+    const t0 = Date.now();
+    let s = await state();
+    while (s.link !== 'connected') {
+      if (Date.now() - t0 > 3000) throw new Error(`replay never connected (link ${s.link})`);
+      await sleep(10);
+      s = await state();
+    }
     expect(s.canControl).toBe(false);
     const r = await fetch(`${base}/api/system`, { method: 'POST', headers: json, body: '{"simulator":true}' });
     expect(r.status).toBe(409);
