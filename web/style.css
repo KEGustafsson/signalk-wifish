@@ -50,15 +50,17 @@ button { font: inherit; color: inherit; }
   .traces .separator { width: auto; height: 1px; }
 }
 
+/* Hidden until a tap shows it, but never removed from the Tab order (visibility:hidden would make it
+   unfocusable): it appears when it, or anything in its trace, has keyboard focus. */
 .trace-gear { position: absolute; left: 14px; top: 14px; width: 52px; height: 52px; border-radius: 50%;
   background: var(--bg-semi); border: 2px solid #fff; color: #fff; opacity: 0; pointer-events: none; transition: opacity .2s; }
 .trace-gear svg { width: 30px; height: 30px; }
-.trace-gear:not(.shown) { visibility: hidden; transition: opacity .2s, visibility 0s .2s; }
-.trace-gear.shown, .trace-gear:focus-visible { opacity: 1; pointer-events: auto; visibility: visible; transition: opacity .2s; }
+.trace-gear.shown, .trace-gear:focus-visible, .trace:focus-within .trace-gear { opacity: 1; pointer-events: auto; }
 
 .history-scroll { position: absolute; left: 12px; right: 70px; top: 10px; height: 34px; border-radius: 17px;
   background: #0009; border: 1px solid #fff5; z-index: 3; cursor: pointer; touch-action: none; }
 .history-scroll .thumb { position: absolute; top: 3px; bottom: 3px; left: 0; border-radius: 14px; background: #ffffffc0; }
+.history-scroll:focus-visible { outline: 2px solid var(--highlight); outline-offset: 2px; }
 .ff { position: absolute; right: 14px; top: 6px; width: 44px; height: 42px; border-radius: 21px; background: #000a; border: 2px solid #fff; color: #fff; z-index: 3; }
 .ff svg { width: 26px; height: 26px; }
 

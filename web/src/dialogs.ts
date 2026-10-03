@@ -3,8 +3,8 @@
 import { PALETTES, SONAR_PALETTES, DOWNVISION_PALETTES, cssColour } from './palettes';
 import { prefs, savePrefs } from './prefs';
 import { TILES } from './icons';
-import { DEPTH_UNITS, presetCm, type DepthUnit } from '../../src/shared/units';
-import type { ChannelName, ChannelPatch, ChannelSettingsView, DisplayPrefs, SystemPatch, VesselSettings, WifishState } from '../../src/shared/api';
+import { DEPTH_UNITS, MAX_TRANSDUCER_OFFSET_CM, formatDepth, isDepthUnitId, isTempUnit, presetCm, type DepthUnit } from '../../src/shared/units';
+import type { ChannelName, ChannelPatch, DisplayPrefs, SystemPatch, VesselSettings, WifishState } from '../../src/shared/api';
 import type { ViewConfig } from './prefs';
 
 /**
@@ -61,8 +61,8 @@ export function openDialog(content: Node, opts: DialogOptions = {}): DialogHandl
   document.body.append(layer);
   const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   let open = true;
-  /** Visible, enabled focusable elements inside the dialog. */
-  const focusables = () => [...box.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((e) => e.offsetParent !== null);
+  /** Visible, enabled elements in the dialog's Tab order (a tab with tabindex=-1 is reached with arrow keys, not Tab). */
+  const focusables = () => [...box.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((e) => e.offsetParent !== null && e.tabIndex >= 0);
   /** Keep Tab inside a modal dialog: wrap focus between its first and last focusable elements. */
   const trap = (e: KeyboardEvent) => {
     if (e.key !== 'Tab' || !opts.modal || stack[stack.length - 1] !== handle) return;
@@ -114,8 +114,13 @@ export function openDialog(content: Node, opts: DialogOptions = {}): DialogHandl
     place();
   }
   stack.push(handle);
-  // Move focus into the dialog so keyboard and screen-reader users land in it.
-  requestAnimationFrame(() => { if (open) (focusables()[0] ?? box).focus({ preventScroll: true }); });
+  // Move focus into the dialog so keyboard and screen-reader users land in it: on the selected
+  // tab of a tabbed dialog, else the first element in its Tab order.
+  requestAnimationFrame(() => {
+    if (!open) return;
+    const tab = box.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+    (tab ?? focusables()[0] ?? box).focus({ preventScroll: true });
+  });
   return handle;
 }
 
@@ -222,8 +227,8 @@ export function sonarSettings(ctx: Ctx, ch: ChannelName, anchor: HTMLElement | n
   const root = h('div', { class: 'sonar-settings' }, tabs, panels);
 
   let dragging: string | null = null;
-  /** Send a channel settings patch; failures are ignored (the next state update shows the real values). */
-  const send = (patch: ChannelPatch) => { ctx.sendChannel(ch, patch).catch(() => {}); };
+  /** Send a channel settings patch; a failure is toasted by the context and the next state update shows the real values. */
+  const send = (patch: ChannelPatch) => { void ctx.sendChannel(ch, patch); };
   /** True when the plugin accepts commands and holds this channel's settings. */
   const controlsEnabled = () => !!ctx.state()?.canControl && !!ctx.state()?.channels[ch];
 
@@ -405,14 +410,18 @@ export function overflowMenu(anchor: HTMLElement, items: { label: string; action
   return d;
 }
 
-/** Transducer offset magnitude for display: feet and inches, or one decimal in metres/fathoms. */
+/** Whole inches nearest to `cm`. */
+const toInches = (cm: number): number => Math.round(cm / 2.54);
+
+/** Transducer offset magnitude for display: feet and inches, or one decimal (truncated like the readout) in metres/fathoms. */
 function formatOffset(cm: number, u: DepthUnit): string {
   const a = Math.abs(cm);
   if (u.id === 'ft') {
-    const inches = Math.round(a / 2.54);
+    const inches = toInches(a);
     return `${Math.floor(inches / 12)}' ${inches % 12}"`;
   }
-  return `${(a / u.cm).toFixed(1)} ${u.symbol}`;
+  const d = formatDepth(a, u);
+  return `${d.whole}.${d.frac} ${d.symbol}`;
 }
 
 /** Main settings (app: MainSettingsFragment). */
@@ -445,11 +454,17 @@ export function mainSettings(ctx: Ctx): DialogHandle {
   paintWaterline();
   waterline.addEventListener('click', () => waterlineDepth(ctx));
 
-  const devUnit = s?.system ? DEPTH_UNITS.find((u) => u.code === s.system!.depthUnit) : undefined;
+  const sys = s?.system;
+  const devUnit = sys ? DEPTH_UNITS.find((u) => u.code === sys.depthUnit) : undefined;
   const unitSel = select(
     [{ value: '', label: `Sonar setting${devUnit ? ` (${devUnit.label})` : ''}` }, ...DEPTH_UNITS.map((u) => ({ value: u.id, label: u.label }))],
-    prefs.depthUnit ?? '', (v) => { ctx.setUnits({ depthUnit: (v || null) as DisplayPrefs['depthUnit'] }); paintDepth(); paintWaterline(); }, 'Depth units');
-  const tempSel = select([{ value: 'F', label: '°F' }, { value: 'C', label: '°C' }], prefs.tempUnit, (v) => ctx.setUnits({ tempUnit: v as 'C' | 'F' }), 'Temperature units');
+    prefs.depthUnit ?? '', (v) => {
+      ctx.setUnits({ depthUnit: isDepthUnitId(v) ? v : null });
+      paintDepth();
+      paintWaterline();
+    }, 'Depth units');
+  const tempSel = select([{ value: 'F', label: '°F' }, { value: 'C', label: '°C' }], prefs.tempUnit,
+    (v) => { if (isTempUnit(v)) ctx.setUnits({ tempUnit: v }); }, 'Temperature units');
 
   /** Append a labelled settings row to the table. */
   const row = (label: string, el: HTMLElement) => table.append(h('div', { class: 'row' }, h('span', { class: 'label' }, label), el));
@@ -459,34 +474,51 @@ export function mainSettings(ctx: Ctx): DialogHandle {
   row('Temperature units', tempSel);
   // Like the app, the simulator switch is offered for the Wi-Fish only (MainSettingsFragment.h()).
   if (s?.system && s.unit?.wifish) {
-    row('Simulator', toggle(s.system.simulator, (v) => { ctx.sendSystem({ simulator: v }).catch(() => {}); }, 'Simulator'));
+    row('Simulator', toggle(s.system.simulator, (v) => { void ctx.sendSystem({ simulator: v }); }, 'Simulator'));
   }
   // Another viewer may change the shared units while this dialog is open.
   const unsub = ctx.onState(() => { paintDepth(); paintWaterline(); unitSel.value = prefs.depthUnit ?? ''; tempSel.value = prefs.tempUnit; });
   return openDialog(table, { title: 'Settings', modal: true, className: 'main', onClose: unsub });
 }
 
+/** `<option>`s 0..n-1 labelled by `label`. */
+const numberOptions = (n: number, label: (i: number) => string = String) =>
+  [...Array(Math.max(0, n)).keys()].map((i) => ({ value: String(i), label: label(i) }));
+
 /**
- * Distance picker of the transducer depth dialog: feet and inches, or tenths of a metre
- * (up to 3.0 m) or fathom. `read` returns the picked distance in cm, at most 300.
+ * Distance picker of the transducer depth dialog: feet and inches, or tenths of a metre or
+ * fathom, up to MAX_TRANSDUCER_OFFSET_CM (the lists stop where the limit is, so a pick is never
+ * capped silently). `read` returns the picked distance in cm.
  */
 function distancePicker(u: DepthUnit, cm: number): { row: HTMLElement; read: () => number } {
-  const a = Math.abs(cm);
+  const MAX = MAX_TRANSDUCER_OFFSET_CM;
+  const a = Math.min(MAX, Math.abs(cm));
   const row = h('div', { class: 'td-row' });
   let read: () => number;
   if (u.id === 'ft') {
-    const inches = Math.round(a / 2.54);
-    const ft = select([...Array(10).keys()].map((i) => ({ value: String(i), label: String(i) })), String(Math.min(9, Math.floor(inches / 12))), () => {}, 'Feet');
-    const inch = select([...Array(12).keys()].map((i) => ({ value: String(i), label: String(i) })), String(inches % 12), () => {}, 'Inches');
+    const INCH = 2.54;
+    const maxFt = Math.floor(MAX / u.cm);
+    /** Inches offered with `ft` feet: 0..11, fewer at the last foot so the total stays within the limit. */
+    const inchesFor = (ft: number) => (ft < maxFt ? 12 : Math.floor((MAX - maxFt * u.cm) / INCH) + 1);
+    const inches = toInches(a);
+    const ft0 = Math.min(maxFt, Math.floor(inches / 12));
+    const in0 = Math.min(inchesFor(ft0) - 1, inches % 12);
+    const inch = select(numberOptions(inchesFor(ft0)), String(in0), () => {}, 'Inches');
+    const ft = select(numberOptions(maxFt + 1), String(ft0), (v) => {
+      // Rebuild the inch list for the new foot, keeping the inches when they still fit.
+      const keep = Math.min(inchesFor(Number(v)) - 1, Number(inch.value));
+      inch.replaceChildren(...numberOptions(inchesFor(Number(v))).map((o) => h('option', { value: o.value }, o.label)));
+      inch.value = String(keep);
+    }, 'Feet');
     row.append(ft, h('span', { class: 'unit' }, 'ft'), inch, h('span', { class: 'unit' }, 'in'));
-    read = () => Math.trunc(Number(ft.value) * u.cm + Number(inch.value) * 2.54);
+    read = () => Math.trunc(Number(ft.value) * u.cm + Number(inch.value) * INCH);
   } else {
-    const max = u.id === 'm' ? 30 : 16;
-    const tenth = select([...Array(max + 1).keys()].map((i) => ({ value: String(i), label: (i / 10).toFixed(1) })), String(Math.min(max, Math.round((a / u.cm) * 10))), () => {}, 'Depth');
+    const max = Math.floor((MAX / u.cm) * 10); // tenths of a unit within the limit
+    const tenth = select(numberOptions(max + 1, (i) => (i / 10).toFixed(1)), String(Math.min(max, Math.round((a / u.cm) * 10))), () => {}, 'Depth');
     row.append(tenth, h('span', { class: 'unit' }, u.symbol));
     read = () => (u.id === 'm' ? Number(tenth.value) * 10 : Math.trunc(Number(tenth.value) * 0.1 * u.cm));
   }
-  return { row, read: () => Math.min(300, read()) };
+  return { row, read: () => Math.min(MAX, read()) };
 }
 
 /** Transducer depth (app: TransducerDepthFragment). Applied when the dialog closes. */
@@ -510,7 +542,7 @@ export function transducerDepth(ctx: Ctx, onDone: () => void): DialogHandle {
       if (!touched) return;
       const cm = read();
       const value = above.checked ? -cm : cm;
-      if (value !== off) ctx.sendSystem({ transducerOffsetCm: value }).then(onDone, () => {});
+      if (value !== off) void ctx.sendSystem({ transducerOffsetCm: value }).then(onDone);
     },
   });
 }
@@ -548,8 +580,10 @@ export function helpDialog(): DialogHandle {
   const items: [string, string][] = [
     ['Scrolling image', 'New sonar pings enter on the right and scroll to the left.'],
     ['History', 'Drag the image sideways to look back through the sonar history. Tap ⏩ (or drag to the right end) to return to the live picture.'],
-    ['Zoom', 'Pinch vertically or use the mouse wheel to zoom into the water column. The zoom box on the right shows where you are; double-tap to zoom out.'],
-    ['Speed', 'Pinch horizontally, or Ctrl + wheel, to stretch or compress the scrolling image.'],
+    ['Zoom', 'Pinch vertically to zoom into the water column. The zoom box on the right shows where you are; double-tap to zoom out.'],
+    ['Speed', 'Pinch horizontally to stretch or compress the scrolling image.'],
+    ['Mouse and trackpad', 'Ctrl + wheel or Alt + wheel: scroll speed; trackpad pinch (and plain wheel): zoom. Shift + wheel (or a sideways wheel) scrolls through history.'],
+    ['Keyboard', 'While paused, Tab to the history scrollbar: ← / → step back and forward, Page Up / Page Down move a screen, Home shows the oldest pings and End returns to live. Tab also reaches each trace’s ⚙ button.'],
     ['Adjustments', 'Tap a Sonar or DownVision trace, then its ⚙ button, to change sensitivity, range and palette.'],
     ['Toolbar', 'Switch views, pause the image or save a snapshot from the toolbar. ⋯ opens settings.'],
     ['Details', 'Press and hold on the image to see the depth and time at that point.'],

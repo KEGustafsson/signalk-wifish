@@ -8,13 +8,15 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 const watch = process.argv.includes('--watch');
 
-const common = { bundle: true, minify: !watch, sourcemap: watch ? true : 'external', logLevel: 'info', legalComments: 'none' };
+// Production builds ship without source maps (they are not in the package anyway); --watch links them for debugging.
+const common = { bundle: true, minify: !watch, sourcemap: watch ? 'linked' : false, logLevel: 'info', legalComments: 'none' };
 const js = {
   ...common,
   entryPoints: [path.join(root, 'web/src/main.ts')],
   outfile: path.join(root, 'public/app.js'),
   format: 'iife',
-  target: ['es2020'],
+  // es2022 keeps #private fields native instead of lowering them to WeakMap helpers.
+  target: ['es2022'],
   define: { __VERSION__: JSON.stringify(pkg.version) },
 };
 const css = {

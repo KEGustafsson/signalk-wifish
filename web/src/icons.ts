@@ -13,8 +13,6 @@ export const ICONS = {
   sonar: svg('<path d="M7 5.5c3-2 7-2 10 0M8.5 8c2-1.3 5-1.3 7 0"/><path d="M4.5 15.5c3-3.2 9-3.8 12.5 0-3.5 3.8-9.5 3.2-12.5 0z"/><path d="M17 15.5l3-2.2v4.4z"/>'),
   gear: svg('<circle cx="12" cy="12" r="3"/><path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M5.5 18.5l1.7-1.7M16.8 7.2l1.7-1.7"/><circle cx="12" cy="12" r="6.5"/>'),
   fastForward: svg('<path d="M4 6v12l8-6zM12 6v12l8-6z" fill="currentColor" stroke="none"/>'),
-  close: svg('<path d="M6 6l12 12M18 6L6 18"/>'),
-  help: svg('<circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.4 2.3c-.6.3-.9.8-.9 1.4v.6"/><circle cx="12" cy="17" r=".9" fill="currentColor" stroke="none"/>'),
 };
 
 /** Large tile art for the view switcher (fish = CHIRP sonar, tree = DownVision). */
