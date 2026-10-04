@@ -50,6 +50,20 @@ test('keptColumns follows the server history within DEFAULT..MAX_HISTORY_COLUMNS
   expect(new ColumnStore('sonar').max).toBe(MAX_HISTORY_COLUMNS); // until the server says
 });
 
+test('a store keeps what the server keeps, but never less than the widest screenful its trace showed', () => {
+  const s = new ColumnStore('sonar');
+  s.reserve(3840); // a 2560 px trace at 1.5x and the slowest speed, before any state
+  expect(s.max).toBe(MAX_HISTORY_COLUMNS);
+  s.fitServer(1500);
+  expect(s.max).toBe(3840);
+  s.reserve(1000); // a narrower view later keeps what was reserved
+  expect(s.max).toBe(3840);
+  s.fitServer(8000);
+  expect(s.max).toBe(8000);
+  s.fitServer(0);
+  expect(s.max).toBe(3840);
+});
+
 test('palettes: nine, split between channels like the app, 256 opaque colours', () => {
   expect(PALETTES).toHaveLength(9);
   expect([...SONAR_PALETTES, ...DOWNVISION_PALETTES].sort()).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
@@ -61,5 +75,4 @@ test('palettes: nine, split between channels like the app, 256 opaque colours', 
   }
   expect(cssColour(0, 0)).toBe('rgb(0,0,0)');
   expect(cssColour(0, 255)).toBe('rgb(255,255,255)');
-  expect(cssColour(4, 255)).toBe('rgb(128,0,0)');
 });

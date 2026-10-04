@@ -406,6 +406,7 @@ export class TraceView {
     const w = this.zoom ?? full;
     const L = this.layout();
     const { mainW, zbW } = this.#devLayout(L);
+    this.store.reserve(visibleColumns(mainW, this.colW)); // keep at least a screenful (wide screen, slow speed)
     this.#drawEcho(L, mainW, zbW, w, full);
     // A new column alone leaves the rulers as they are: redraw them only when what they show changed.
     const key = this.#overlayKey(L, w, full);

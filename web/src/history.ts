@@ -37,11 +37,35 @@ export class ColumnStore {
   /** Incremented by clear(): column numbers of different generations are unrelated. */
   generation = 0;
   #max: number;
+  /** Columns the server keeps per channel, once a state said so. */
+  #server: number | null = null;
+  /** The most columns its trace has shown at once. */
+  #screen = 0;
   /**
-   * Keeps up to `max` columns; until the server says how many it keeps (resize()) that is its
+   * Keeps up to `max` columns; until the server says how many it keeps (fitServer()) that is its
    * largest history, so a backlog is never cut short.
    */
   constructor(readonly channel: ChannelName, max = MAX_HISTORY_COLUMNS) { this.#max = max; }
+
+  /** Keep what a server keeping `server` columns does (keptColumns), and never less than a screenful (reserve()). */
+  fitServer(server: number): void {
+    this.#server = server;
+    this.#fit();
+  }
+
+  /** Its trace shows `n` columns at once (a wide screen at the slowest speed can show more than the server keeps). */
+  reserve(n: number): void {
+    if (n <= this.#screen) return;
+    this.#screen = n;
+    this.#fit();
+  }
+
+  /** Resize to the server's history or the widest screenful, whichever is larger, once the server's is known. */
+  #fit(): void {
+    if (this.#server === null) return;
+    const max = Math.max(keptColumns(this.#server), Math.min(MAX_HISTORY_COLUMNS, this.#screen));
+    if (max !== this.#max) this.resize(max);
+  }
 
   /** Columns kept at most. */
   get max(): number { return this.#max; }

@@ -1,6 +1,7 @@
 # Code review: leaner, lighter, better, faster
 
-Date: 2026-10-04. Branch `main` at fa31e6c. Five parallel review passes (server protocol
+Date: 2026-10-04. Branch `main` at fa31e6c. **Status: the findings below were fixed in
+the same pull request; section 9 lists what was done differently or left as is.** Five parallel review passes (server protocol
 layer, plugin/engine/API, web app, tests/tooling/packaging, and a dedicated pass on the
 "sonar not available" behaviour), every finding re-checked against the source and, where
 numbers are quoted, measured on the built `dist/` or `public/` output. Nothing was changed.
@@ -380,3 +381,35 @@ whitelist; the Node engine floor.
 4. Web rendering: 2.1, 2.3, then 2.2.
 5. Memory: 3.1 (option A), 3.2.
 6. Lean sweep in section 4 as one commit, running the full suite after each file.
+
+## 9. Resolution
+
+Every finding in sections 1 to 5 was addressed in this pull request, with tests where the
+code is testable. Measured afterwards: 214 tests pass (199 before), the suite runs in about
+2.2 s (3.6 s), and the tests are now type-checked. Where the fix differs from the
+suggestion, or something was deliberately left:
+
+- **1.1 sender filter**: implemented and tested (the test fails without the filter). Still
+  worth confirming once on hardware that sonar data arrives from the announced device IP;
+  the protocol and the announcement check say it does.
+- **5.1 lost sonar**: the "Sonar offline" status is kept, as a status. A sonar that is
+  switched off is normal on a moored boat, so it is not made a plugin error; only a
+  missing network interface or interface address is.
+- **5.1 quick reboot**: handled without a full session reset. After a lost link the next
+  broadcast of each setting is accepted whatever its seq, so the readout keeps the old
+  settings until the new ones arrive instead of blanking.
+- **5.1 null heartbeat**: behaviour kept (a sonar that keeps reporting no bottom lock
+  re-sends null at the heartbeat, which is fine for Signal K consumers); the comment now
+  says so.
+- **5.1 rate-limited latency**: changed. A held-back change goes out as soon as the limit
+  allows; the engine test now pins that.
+- **3.1 history memory**: option A (one JSON string per column, framed at write time).
+- **3.3 browser history**: the store keeps the server's count, at least the default, and
+  never less than the widest screenful its trace has shown.
+- **3.5 screenshots**: recompressed losslessly (pixel-identical, 17 kB smaller); the
+  lossy option was not taken.
+- **Not done**: the offscreen strip canvas (suspected only, needs a browser profile);
+  canvas context loss is not handled (as before).
+- **Not verified in a browser**: the web rendering, focus and timing changes. The
+  incremental drawing was checked against full redraws in a pixel-exact simulation of
+  4 000 random steps (scrolls both ways, zoom, resize, clears) with no mismatch.

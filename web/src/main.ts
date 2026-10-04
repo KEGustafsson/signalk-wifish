@@ -1,6 +1,6 @@
 // Wi-Fish Sonar web app: the Android app's sonar screen for a browser.
 
-import { ColumnStore, keptColumns } from './history';
+import { ColumnStore } from './history';
 import { TraceView } from './trace';
 import { clampSpeed } from './geometry';
 import { PluginStream, setChannel, setDisplay, setSystem, setVessel } from './stream';
@@ -675,10 +675,7 @@ function onState(s: WifishState | null): void {
     epoch = s.epoch;
   }
   // Keep as many columns as the server does (it sends no more), at least a screenful.
-  if (s && Number.isFinite(s.historyColumns)) {
-    const max = keptColumns(s.historyColumns);
-    for (const t of TRACES) if (t.store.max !== max) t.store.resize(max);
-  }
+  if (s && Number.isFinite(s.historyColumns)) for (const t of TRACES) t.store.fitServer(s.historyColumns);
   const prevWifish = isWifish();
   const prevSys = state?.system ?? null;
   state = s;
