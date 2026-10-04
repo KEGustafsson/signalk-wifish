@@ -1,7 +1,7 @@
 // Dialogs and popovers, modelled on the app's DialogFragments.
 
 import { PALETTES, SONAR_PALETTES, DOWNVISION_PALETTES, cssColour } from './palettes';
-import { prefs, savePrefs } from './prefs';
+import { prefs, savePrefs, SETTINGS_TABS } from './prefs';
 import { TILES } from './icons';
 import { DEPTH_UNITS, MAX_TRANSDUCER_OFFSET_CM, formatDepth, isDepthUnitId, isTempUnit, presetCm, type DepthUnit } from '../../src/shared/units';
 import type { ChannelName, ChannelPatch, DisplayPrefs, SystemPatch, VesselSettings, WifishState } from '../../src/shared/api';
@@ -27,11 +27,13 @@ export const h = <K extends keyof HTMLElementTagNameMap>(
 
 // ------------------------------------------------------------------ framework
 
-export interface DialogHandle { el: HTMLElement; close(): void; readonly open: boolean }
+export interface DialogHandle { el: HTMLElement; close(): void }
 let stack: DialogHandle[] = [];
 
 export interface DialogOptions {
   title?: string;
+  /** Accessible name for a dialog without a title. */
+  label?: string;
   className?: string;
   /** Show as a popover below this element (with an arrow), like the app's anchored dialogs. */
   anchor?: HTMLElement | null;
@@ -55,6 +57,8 @@ export function openDialog(content: Node, opts: DialogOptions = {}): DialogHandl
     const id = `dialog-title-${++dialogIds}`;
     box.append(h('div', { class: 'dialog-title', id }, opts.title));
     box.setAttribute('aria-labelledby', id);
+  } else if (opts.label) {
+    box.setAttribute('aria-label', opts.label);
   }
   box.append(content);
   layer.append(box);
@@ -77,8 +81,6 @@ export function openDialog(content: Node, opts: DialogOptions = {}): DialogHandl
   const onResize = () => place?.();
   const handle: DialogHandle = {
     el: box,
-    /** False once the dialog has been closed. */
-    get open() { return open; },
     /** Remove the dialog and its listeners, call `onClose`, and return focus to where it was; idempotent. */
     close() {
       if (!open) return;
@@ -87,6 +89,7 @@ export function openDialog(content: Node, opts: DialogOptions = {}): DialogHandl
       document.removeEventListener('keydown', trap);
       window.removeEventListener('resize', onResize);
       stack = stack.filter((d) => d !== handle);
+      opts.anchor?.setAttribute('aria-expanded', 'false');
       opts.onClose?.();
       if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
     },
@@ -97,6 +100,7 @@ export function openDialog(content: Node, opts: DialogOptions = {}): DialogHandl
   let place: (() => void) | null = null;
   if (opts.anchor) {
     const anchor = opts.anchor;
+    anchor.setAttribute('aria-expanded', 'true'); // until close()
     box.classList.add('anchored');
     place = () => {
       const r = anchor.getBoundingClientRect();
@@ -217,8 +221,6 @@ export interface Ctx {
   onState(cb: (s: WifishState | null) => void): () => void;
 }
 
-const TABS = ['Sensitivity', 'Range', 'Options'];
-
 /** Sonar / DownVision settings popover: Sensitivity, Range, Options tabs (app: SonarSettingsFragment). */
 export function sonarSettings(ctx: Ctx, ch: ChannelName, anchor: HTMLElement | null, onClose: () => void): DialogHandle {
   const title = ch === 'sonar' ? 'Sonar' : 'DownVision';
@@ -261,11 +263,13 @@ export function sonarSettings(ctx: Ctx, ch: ChannelName, anchor: HTMLElement | n
   const shallow = h('select', { class: 'select', 'aria-label': 'Shallow' });
   const deep = h('select', { class: 'select', 'aria-label': 'Deep' });
   shallow.addEventListener('change', () => {
+    filled.shallow = ''; // the user's pick, not a fill: rebuild on the next refresh once it is not focused
     rangeAuto.checked = false;
     send({ rangeAuto: false, rangeShallowCm: Number(shallow.value) });
     fillRange(Number(shallow.value), Number(deep.value), 'deep'); // Deep may only offer presets below the new Shallow
   });
   deep.addEventListener('change', () => {
+    filled.deep = '';
     rangeAuto.checked = false;
     send({ rangeAuto: false, rangeDeepCm: Number(deep.value) });
     fillRange(Number(shallow.value), Number(deep.value), 'shallow');
@@ -275,9 +279,15 @@ export function sonarSettings(ctx: Ctx, ch: ChannelName, anchor: HTMLElement | n
     h('span', { class: 'label' }, 'Shallow'), shallow, unitLabelA,
     h('span', { class: 'label' }, 'Deep'), deep, unitLabelB);
 
+  /** Unit, shallow and deep each list was last filled for; a state update with the same values leaves it alone. */
+  const filled = { shallow: '', deep: '' };
   /** Rebuild the preset lists; `only` limits it to one list (the other one may be open or focused). */
   function fillRange(shallowCm: number, deepCm: number, only?: 'shallow' | 'deep'): void {
     const u = ctx.depthUnit();
+    const key = `${u.id}:${shallowCm}:${deepCm}`;
+    const doShallow = only !== 'deep' && filled.shallow !== key;
+    const doDeep = only !== 'shallow' && filled.deep !== key;
+    if (!doShallow && !doDeep) return;
     unitLabelA.textContent = unitLabelB.textContent = u.symbol;
     const presets = u.ranges.map((r, i) => ({ cm: presetCm(u, i), label: String(r) }));
     /** `<option>`s for `list`, with the preset nearest `sel` cm selected. */
@@ -287,8 +297,8 @@ export function sonarSettings(ctx: Ctx, ch: ChannelName, anchor: HTMLElement | n
       return list.map((p) => { const o = h('option', { value: p.cm }, p.label); if (p === near) o.selected = true; return o; });
     };
     // Shallow offers presets below Deep, Deep presets above Shallow (app: g0.a).
-    if (only !== 'deep') shallow.replaceChildren(...opt(presets.filter((p) => p.cm < deepCm), shallowCm));
-    if (only !== 'shallow') deep.replaceChildren(...opt(presets.filter((p) => p.cm > shallowCm), deepCm));
+    if (doShallow) { shallow.replaceChildren(...opt(presets.filter((p) => p.cm < deepCm), shallowCm)); filled.shallow = key; }
+    if (doDeep) { deep.replaceChildren(...opt(presets.filter((p) => p.cm > shallowCm), deepCm)); filled.deep = key; }
   }
 
   // --- Options
@@ -316,7 +326,7 @@ export function sonarSettings(ctx: Ctx, ch: ChannelName, anchor: HTMLElement | n
   panels.append(...panelEls);
   const uid = `ss-${ch}`;
   panelEls.forEach((p, i) => { p.id = `${uid}-panel-${i}`; p.setAttribute('role', 'tabpanel'); p.setAttribute('aria-labelledby', `${uid}-tab-${i}`); });
-  const tabEls = TABS.map((t, i) => {
+  const tabEls = SETTINGS_TABS.map((t, i) => {
     const b = h('button', { class: 'tab', role: 'tab', id: `${uid}-tab-${i}`, 'aria-controls': `${uid}-panel-${i}` }, t);
     b.addEventListener('click', () => select_(i));
     // Arrow keys move between tabs (WAI-ARIA tabs pattern).
@@ -324,7 +334,7 @@ export function sonarSettings(ctx: Ctx, ch: ChannelName, anchor: HTMLElement | n
       const d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
       if (!d) return;
       e.preventDefault();
-      const next = (i + d + TABS.length) % TABS.length;
+      const next = (i + d + SETTINGS_TABS.length) % SETTINGS_TABS.length;
       select_(next);
       tabEls[next].focus();
     });
@@ -341,7 +351,7 @@ export function sonarSettings(ctx: Ctx, ch: ChannelName, anchor: HTMLElement | n
     });
     panelEls.forEach((p, k) => { p.hidden = k !== i; });
   };
-  select_(Math.max(0, Math.min(2, prefs.settingsTab)));
+  select_(prefs.settingsTab); // in range: sanitize() clamps it when the prefs load
 
   const note = h('div', { class: 'settings-note' });
   root.append(note);
@@ -371,7 +381,7 @@ export function sonarSettings(ctx: Ctx, ch: ChannelName, anchor: HTMLElement | n
   refresh(ctx.state());
   const unsub = ctx.onState(refresh);
 
-  return openDialog(root, { anchor, className: `settings-popover ${ch}`, onClose: () => { unsub(); onClose(); }, title: undefined });
+  return openDialog(root, { anchor, className: `settings-popover ${ch}`, label: `${title} settings`, onClose: () => { unsub(); onClose(); } });
 }
 
 /** View switcher grid (app: ViewSwitcherFragment). Map, camera and waypoint views are not part of this web app. */
@@ -382,7 +392,7 @@ export function viewSwitcher(anchor: HTMLElement, current: ViewConfig, available
     { v: 'sonar', label: 'Sonar', art: TILES.sonar },
     { v: 'downvision', label: 'DownVision', art: TILES.downvision },
   ];
-  const d = openDialog(grid, { anchor, className: 'view-switcher' });
+  const d = openDialog(grid, { anchor, className: 'view-switcher', label: 'Switch view' });
   for (const it of items) {
     const ok = it.v === 'split' ? available.length === 2 : available.includes(it.v as ChannelName);
     const b = h('button', { class: `view-tile${it.v === current ? ' selected' : ''}`, title: it.label, 'aria-label': it.label, disabled: !ok, html: it.art });
@@ -394,13 +404,24 @@ export function viewSwitcher(anchor: HTMLElement, current: ViewConfig, available
 
 /** Overflow menu (app: sonar_trace menu). */
 export function overflowMenu(anchor: HTMLElement, items: { label: string; action: () => void }[]): DialogHandle {
-  const list = h('div', { class: 'menu', role: 'menu' });
-  const d = openDialog(list, { anchor, className: 'menu-popover' });
-  for (const it of items) {
+  const list = h('div', { class: 'menu', role: 'menu', 'aria-label': 'More' });
+  const d = openDialog(list, { anchor, className: 'menu-popover', label: 'More' });
+  const buttons = items.map((it) => {
     const b = h('button', { class: 'menu-item', role: 'menuitem' }, it.label);
     b.addEventListener('click', () => { d.close(); it.action(); });
-    list.append(b);
-  }
+    return b;
+  });
+  list.append(...buttons);
+  // Arrow keys, Home and End move between the items (WAI-ARIA menu pattern).
+  list.addEventListener('keydown', (e) => {
+    const i = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    const n = buttons.length;
+    const next = e.key === 'ArrowDown' ? (i + 1) % n : e.key === 'ArrowUp' ? (i <= 0 ? n - 1 : i - 1)
+      : e.key === 'Home' ? 0 : e.key === 'End' ? n - 1 : -1;
+    if (next < 0 || !n) return;
+    e.preventDefault();
+    buttons[next].focus();
+  });
   // Right-align under the anchor.
   requestAnimationFrame(() => {
     const r = anchor.getBoundingClientRect();

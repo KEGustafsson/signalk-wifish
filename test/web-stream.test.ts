@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, afterEach, vi } from 'vitest';
-import { PluginStream, isColumn, isState, setChannel, setDisplay, type StreamHandlers, RECONNECT_MIN_MS, RECONNECT_MAX_MS } from '../web/src/stream';
+import { PluginStream, isColumn, isState, setChannel, setDisplay, type StreamHandlers, DROP_GRACE_MS, RECONNECT_MIN_MS, RECONNECT_MAX_MS } from '../web/src/stream';
 
 /** EventSource stub: records listeners, lets a test dispatch events and set readyState. */
 class FakeES {
@@ -147,6 +147,47 @@ test('an error on a stale EventSource (replaced by open()) schedules nothing', (
   vi.advanceTimersByTime(RECONNECT_MAX_MS * 2);
   expect(FakeES.instances).toHaveLength(2);
   s.close();
+});
+
+test('a drop the browser retries is reported only after DROP_GRACE_MS; a first connect or a fatal reply at once', () => {
+  const h = handlers();
+  const s = new PluginStream(h);
+  s.open();
+  const es = FakeES.instances[0];
+  es.emit('error'); // the first connect fails: no grace
+  expect(h.calls).toEqual(['conn:false']);
+  es.emit('open');
+  es.readyState = 0;
+  es.emit('error'); // a Wi-Fi hiccup: the browser retries
+  vi.advanceTimersByTime(DROP_GRACE_MS - 1);
+  es.emit('open'); // back within the grace: nothing reported
+  vi.advanceTimersByTime(DROP_GRACE_MS * 2);
+  expect(h.calls).toEqual(['conn:false', 'conn:true', 'conn:true']);
+  h.calls.length = 0;
+  es.emit('error');
+  vi.advanceTimersByTime(DROP_GRACE_MS - 1000);
+  es.emit('error'); // a failed retry does not restart the grace
+  vi.advanceTimersByTime(999);
+  expect(h.calls).toEqual([]);
+  vi.advanceTimersByTime(1);
+  expect(h.calls).toEqual(['conn:false']);
+  es.emit('error'); // already reported down: at once
+  expect(h.calls).toEqual(['conn:false', 'conn:false']);
+  h.calls.length = 0;
+  es.emit('open');
+  es.emit('error');
+  es.readyState = 2;
+  es.emit('error'); // the browser gave up: at once, and the pending grace is dropped
+  vi.advanceTimersByTime(DROP_GRACE_MS * 2);
+  expect(h.calls).toEqual(['conn:true', 'conn:false']);
+  // close() drops a pending report
+  const next = FakeES.instances[FakeES.instances.length - 1];
+  next.emit('open');
+  next.readyState = 0;
+  next.emit('error');
+  s.close();
+  vi.advanceTimersByTime(DROP_GRACE_MS * 2);
+  expect(h.calls).toEqual(['conn:true', 'conn:false', 'conn:true']);
 });
 
 /** fetch stub returning `status` with `body` (a string is returned as-is, anything else as JSON). */

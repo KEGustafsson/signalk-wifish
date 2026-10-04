@@ -1,6 +1,7 @@
 // Viewer preferences (per browser), like the app's SharedPreferences.
 
 import { DEFAULT_PALETTE, DOWNVISION_PALETTES, SONAR_PALETTES } from './palettes';
+import { clampSpeed } from './geometry';
 import { isDepthUnitId, isTempUnit, type DepthUnitId, type TempUnit } from '../../src/shared/units';
 
 export type ViewConfig = 'split' | 'sonar' | 'downvision';
@@ -26,9 +27,8 @@ export type PrefKey = keyof Prefs;
 const KEY = 'signalk-wifish.prefs';
 /** Keys the user picked in this browser (as opposed to defaults that only happen to be stored). */
 const PICKED_KEY = 'signalk-wifish.prefs.picked';
-export const MIN_SPEED = 1;
-export const MAX_SPEED = 5;
-export const SETTINGS_TABS = 3;
+/** Tabs of the sonar settings popover; `settingsTab` indexes them. */
+export const SETTINGS_TABS = ['Sensitivity', 'Range', 'Options'] as const;
 
 /**
  * Prefs the user picked in this browser, as opposed to defaults. Only these are ever offered
@@ -67,8 +67,8 @@ export function sanitize(stored: unknown, base: Prefs = defaults()): Prefs {
   if (s.depthUnit === null || isDepthUnitId(s.depthUnit)) p.depthUnit = s.depthUnit;
   if (isTempUnit(s.tempUnit)) p.tempUnit = s.tempUnit;
   if (isViewConfig(s.view)) p.view = s.view;
-  if (isNum(s.speed)) p.speed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, s.speed));
-  if (isNum(s.settingsTab)) p.settingsTab = Math.max(0, Math.min(SETTINGS_TABS - 1, Math.trunc(s.settingsTab)));
+  if (isNum(s.speed)) p.speed = clampSpeed(s.speed);
+  if (isNum(s.settingsTab)) p.settingsTab = Math.max(0, Math.min(SETTINGS_TABS.length - 1, Math.trunc(s.settingsTab)));
   return p;
 }
 

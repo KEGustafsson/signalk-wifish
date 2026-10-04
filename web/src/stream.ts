@@ -18,6 +18,11 @@ export interface StreamHandlers {
 /** Reconnect delay after the browser gave up on the stream: 1 s doubling to 30 s. */
 export const RECONNECT_MIN_MS = 1000;
 export const RECONNECT_MAX_MS = 30_000;
+/**
+ * How long a dropped stream the browser is retrying itself (every 2 s, the server's `retry`) may
+ * stay down before it is reported, so a Wi-Fi hiccup does not flash the connecting screen.
+ */
+export const DROP_GRACE_MS = 3000;
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const numOrNull = (v: unknown): boolean => v === null || (typeof v === 'number' && Number.isFinite(v));
@@ -44,21 +49,31 @@ export class PluginStream {
   #es: EventSource | null = null;
   #timer: number | undefined;
   #backoff = RECONNECT_MIN_MS;
+  /** Pending report of a drop (see DROP_GRACE_MS). */
+  #grace: number | undefined;
+  /** Last reported connection state. */
+  #up = false;
   /** `h` receives the stream's events. */
   constructor(private h: StreamHandlers) {}
 
   /** (Re)connect the SSE stream and route its events to the handlers. */
   open(): void {
-    this.close();
+    this.#shut();
     const es = new EventSource(`${API_BASE}/stream`);
     this.#es = es;
-    es.addEventListener('open', () => { this.#backoff = RECONNECT_MIN_MS; this.h.connection(true); });
+    es.addEventListener('open', () => {
+      this.#backoff = RECONNECT_MIN_MS;
+      this.#cancelGrace();
+      this.#up = true;
+      this.h.connection(true);
+    });
     es.addEventListener('error', () => {
-      this.h.connection(false);
       // The browser retries a dropped connection itself, but gives up for good on a non-200 or
       // non-SSE reply (the plugin's 503 "too many viewers", a proxy's 502/503 during a restart):
       // then reopen with capped exponential backoff.
-      if (es.readyState === EventSource.CLOSED && this.#es === es) this.#scheduleReopen();
+      const closed = es.readyState === EventSource.CLOSED;
+      this.#down(closed);
+      if (closed && this.#es === es) this.#scheduleReopen();
     });
     this.#on(es, 'display', isObj, (d) => this.h.display(d as DisplayPrefs));
     this.#on(es, 'vessel', isObj, (v) => this.h.vessel(v as VesselSettings));
@@ -91,6 +106,31 @@ export class PluginStream {
     try { fn(); } catch (err) { console.warn(`wifish: error handling "${name}" event`, err); }
   }
 
+  /**
+   * Report the stream down: at once when it was not up (first connect, already reported) or the
+   * browser gave up (`fatal`), else after DROP_GRACE_MS unless it reopens meanwhile.
+   */
+  #down(fatal: boolean): void {
+    if (this.#up && !fatal) {
+      this.#grace ??= setTimeout(() => this.#report(), DROP_GRACE_MS) as unknown as number;
+      return;
+    }
+    this.#report();
+  }
+
+  /** Report the stream down now, cancelling a pending grace. */
+  #report(): void {
+    this.#cancelGrace();
+    this.#up = false;
+    this.h.connection(false);
+  }
+
+  /** Cancel a pending drop report. */
+  #cancelGrace(): void {
+    clearTimeout(this.#grace);
+    this.#grace = undefined;
+  }
+
   /** Reopen after the current backoff, then double it (up to the cap). */
   #scheduleReopen(): void {
     if (this.#timer !== undefined) return;
@@ -99,12 +139,18 @@ export class PluginStream {
     this.#timer = setTimeout(() => { this.#timer = undefined; this.open(); }, delay) as unknown as number;
   }
 
-  /** Close the SSE stream, if open, and cancel a pending reconnect. */
-  close(): void {
+  /** Close the SSE stream, if open, and cancel a pending reconnect (a pending drop report stands). */
+  #shut(): void {
     clearTimeout(this.#timer);
     this.#timer = undefined;
     this.#es?.close();
     this.#es = null;
+  }
+
+  /** Close the SSE stream, if open, and cancel a pending reconnect and drop report. */
+  close(): void {
+    this.#shut();
+    this.#cancelGrace();
   }
 }
 
@@ -118,6 +164,8 @@ async function post<T>(path: string, body: unknown, check: (v: unknown) => v is 
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'same-origin',
+    // Settings applied as a dialog closes may be sent while the page unloads (beforeunload closes them).
+    keepalive: true,
     body: JSON.stringify(body),
   });
   let j: unknown;

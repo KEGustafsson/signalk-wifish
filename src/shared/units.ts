@@ -55,9 +55,10 @@ export const presetCm = (u: DepthUnit, i: number): number => Math.trunc(u.ranges
  * adjacent range presets in any unit (5 ft to 6 ft, 30 cm), so every pair the Range dialog
  * offers is accepted while a degenerate window (a few cm) is not.
  */
-export const MIN_RANGE_WINDOW_CM = Math.min(
+// Annotated pure so bundlers can drop it where unused (the web app): a bare Math.min(...) call is not provably side-effect free.
+export const MIN_RANGE_WINDOW_CM = /* @__PURE__ */ (() => Math.min(
   ...DEPTH_UNITS.flatMap((u) => u.ranges.slice(1).map((_, i) => presetCm(u, i + 1) - presetCm(u, i))),
-);
+))();
 
 /** Depth unit with this id ('ft', 'm', 'fa'); metres if unknown. */
 export function unitById(id: string): DepthUnit {
