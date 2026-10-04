@@ -1,11 +1,11 @@
 import { describe, test, expect } from 'vitest';
 import {
-  MsgId, VERSION, CS, SS, MIN_LEN, messageId, parseHeader, isWellFormed, parseAnnounce, checkService, parseUnit,
+  MsgId, VERSION, CS, SS, messageId, parseHeader, isWellFormed, parseAnnounce, checkService, parseUnit,
   parseBottom, parseEnv, parseError, parseSystemStatus, parsePingResults, parsePingData, buildKeepalive, PingAssembler,
   parseChannelSettings, buildChannelSettings, parseSystemSettings, buildSystemSettings,
 } from '../src/sonar4';
 import { MAX_RANGE_CM } from '../src/shared/units';
-import { msg, segment, channelSettings, systemSettings } from './helpers';
+import { msg, segment, channelSettings, systemSettings, unitMsg, bottomMsg, envMsg } from './helpers';
 
 /** `b` seen through a view with a non-zero byteOffset, as a slice of a receive buffer would be. */
 const offsetView = (b: Uint8Array): Buffer => Buffer.concat([Buffer.alloc(13, 0xee), b]).subarray(13);
@@ -28,6 +28,7 @@ test('checkService rejects unusable announcements', () => {
   const s = { service: 39, group: '239.1.2.3', port: 5801, device: '192.168.1.1', ctrlPort: 5802 };
   expect(checkService(s, '192.168.1.1')).toBeNull();
   expect(checkService(s)).toBeNull();
+  expect(checkService({ ...s, group: 'x.1.2.3' })).toMatch(/not multicast/);
   expect(checkService({ ...s, group: '10.0.0.1' })).toMatch(/not multicast/);
   expect(checkService({ ...s, port: 70000 })).toMatch(/data port/);
   expect(checkService({ ...s, ctrlPort: 0 })).toMatch(/control port/);
@@ -49,21 +50,19 @@ test('isWellFormed enforces §5 minimum and header length', () => {
 });
 
 test('parseUnit strips NUL padding', () => {
-  const b = Buffer.alloc(52);
-  b.writeUInt32LE(1, 0); b.writeUInt32LE(63, 4); b.writeUInt32LE(0xabc123, 8); b.write('Wi-Fish', 20, 'latin1');
-  expect(parseUnit(b)).toEqual({ type: 63, serial: 'abc123', name: 'Wi-Fish' });
+  expect(parseUnit(unitMsg(63, 'Wi-Fish', 0xabc123))).toEqual({ type: 63, serial: 'abc123', name: 'Wi-Fish' });
 });
 
 test('parseBottom: depth in cm, INT32_MIN = no lock, short = null', () => {
   const ok = msg(MsgId.BOTTOM, 22, (b) => { b[16] = 3; b.writeInt32LE(1234, 17); b[21] = 1; });
   expect(parseBottom(ok)).toEqual({ depthCm: 1234, quality: 3, channel: 1 });
-  expect(parseBottom(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(-0x80000000, 17)))!.depthCm).toBeNull();
+  expect(parseBottom(bottomMsg(-0x80000000))!.depthCm).toBeNull();
   expect(parseBottom(ok.subarray(0, 18))).toBeNull();
 });
 
 test('parseEnv: centi-degC, INT16_MIN = invalid', () => {
-  expect(parseEnv(msg(MsgId.ENV, 68, (b) => b.writeInt16LE(-150, 28)))!.waterTempCentiC).toBe(-150);
-  expect(parseEnv(msg(MsgId.ENV, 68, (b) => b.writeInt16LE(-0x8000, 28)))!.waterTempCentiC).toBeNull();
+  expect(parseEnv(envMsg(-150))!.waterTempCentiC).toBe(-150);
+  expect(parseEnv(envMsg(-0x8000))!.waterTempCentiC).toBeNull();
   expect(parseEnv(msg(MsgId.ENV, 29))).toBeNull();
 });
 
@@ -82,9 +81,7 @@ test('parsePingResults needs 130 bytes, like the app', () => {
   const b = msg(MsgId.PING_RESULTS, 130, (x) => { x[16] = 9; x[95] = 1; x.writeInt32LE(0, 104); x.writeInt32LE(1500, 108); });
   expect(parsePingResults(b)).toEqual({ seq: 9, channel: 1, rangeStartCm: 0, rangeEndCm: 1500 });
   expect(parsePingResults(b.subarray(0, 129))).toBeNull();
-  expect(MIN_LEN[MsgId.PING_RESULTS]).toBe(130);
-  expect(MIN_LEN[MsgId.ENV]).toBe(68);
-  expect(parseEnv(msg(MsgId.ENV, 67))).toBeNull();
+  expect(parseEnv(msg(MsgId.ENV, 67))).toBeNull(); // the §5 minimum
 });
 
 test('parsePingData: header length bounds the samples', () => {
@@ -105,7 +102,7 @@ test('parsePingData: header length bounds the samples', () => {
 });
 
 test('parseUnit / parseAnnounce: wrong id or short input is null', () => {
-  const u = Buffer.alloc(52); u.writeUInt32LE(1, 0); u.writeUInt32LE(63, 4);
+  const u = unitMsg();
   expect(parseUnit(u)).not.toBeNull();
   expect(parseUnit(u.subarray(0, 51))).toBeNull();
   const wrongId = Buffer.from(u); wrongId.writeUInt32LE(2, 0);
@@ -118,8 +115,7 @@ test('parseUnit / parseAnnounce: wrong id or short input is null', () => {
 });
 
 test('parseUnit strips control characters from an uninitialised name field', () => {
-  const b = Buffer.alloc(52);
-  b.writeUInt32LE(1, 0); b.writeUInt32LE(63, 4); b.writeUInt32LE(0xc7c035c5, 8);
+  const b = unitMsg(63, '', 0xc7c035c5);
   b.set([0x01, 0x45, 0x37, 0x1f, 0x30, 0x7f, 0x85, 0x32, 0x39, 0x30, 0x20], 20); // no NUL anywhere in the 32 bytes
   b.fill(0x41, 31, 52);
   expect(parseUnit(b)!.name).toBe('E70290 AAAAAAAAAAAAAAAAAAAAA');
@@ -147,10 +143,9 @@ test('every parser works on a view with a non-zero byteOffset', () => {
   expect(parseHeader(offsetView(msg(MsgId.ENV, 68)))).toEqual({ id: MsgId.ENV, length: 68, version: 116, session: 7 });
   const a = Buffer.alloc(36); a.writeUInt32LE(39, 8); a.set([239, 1, 2, 3], 20); a.writeUInt32LE(5801, 24); a.set([192, 168, 1, 1], 28); a.writeUInt32LE(5802, 32);
   expect(parseAnnounce(offsetView(a))).toEqual({ service: 39, group: '239.1.2.3', port: 5801, device: '192.168.1.1', ctrlPort: 5802 });
-  const u = Buffer.alloc(52); u.writeUInt32LE(1, 0); u.writeUInt32LE(66, 4); u.writeUInt32LE(0x1f, 8); u.write('DF5', 20, 'latin1');
-  expect(parseUnit(offsetView(u))).toEqual({ type: 66, serial: '1f', name: 'DF5' });
+  expect(parseUnit(offsetView(unitMsg(66, 'DF5', 0x1f)))).toEqual({ type: 66, serial: '1f', name: 'DF5' });
   expect(parseBottom(offsetView(msg(MsgId.BOTTOM, 22, (b) => { b[16] = 2; b.writeInt32LE(777, 17); b[21] = 1; })))).toEqual({ depthCm: 777, quality: 2, channel: 1 });
-  expect(parseEnv(offsetView(msg(MsgId.ENV, 68, (b) => b.writeInt16LE(1234, 28))))).toEqual({ waterTempCentiC: 1234 });
+  expect(parseEnv(offsetView(envMsg(1234)))).toEqual({ waterTempCentiC: 1234 });
   expect(parseError(offsetView(msg(MsgId.ERROR, 20, (b) => b.writeUInt32LE(0x101, 16))))).toEqual({ flags: 0x101, lowVoltage: true });
   expect(parseSystemStatus(offsetView(msg(MsgId.SYS_STATUS, 1063, (b) => { b[18] = 13; b[19] = 31; b.write('OK', 39, 'latin1'); })))).toEqual({ swMajor: 13, swMinor: 31, text: 'OK' });
   expect(parsePingResults(offsetView(msg(MsgId.PING_RESULTS, 130, (b) => { b[16] = 3; b[95] = 0; b.writeInt32LE(10, 104); b.writeInt32LE(900, 108); }))))
@@ -286,7 +281,7 @@ describe('PingAssembler', () => {
     expect(a.push(parsePingData(segment({ seq: 4, seg: 0, count: 2, total: 4, offset: 0, data: [1, 2] })))).toBeNull();
     const col = a.push(parsePingData(segment({ seq: 4, seg: 1, count: 2, total: 4, offset: 2, data: [3, 4] })))!;
     expect([...col.samples]).toEqual([1, 2, 3, 4]);
-    expect(col.results!.rangeEndCm).toBe(600);
+    expect(col.results.rangeEndCm).toBe(600);
     expect(col.dataType).toBe(2);
     expect(col.setting).toBe(5);
   });
@@ -311,6 +306,12 @@ describe('PingAssembler', () => {
     ];
     for (const b of bad) expect(a.push(parsePingData(b))).toBeNull();
     expect(a.push(parsePingData(Buffer.alloc(36)))).toBeNull();
+    expect(a.dropped).toBe(0); // nothing partial was ever started
+    // A first segment that does not start at offset 0 is refused before anything is allocated,
+    // and a partial it would have replaced is counted once.
+    a.push(parsePingData(segment({ seq: 2, seg: 0, count: 2, total: 4, offset: 0, data: [1, 1] })));
+    expect(a.push(parsePingData(segment({ seq: 2, seg: 0, count: 2, total: 4, offset: 2, data: [1, 1] })))).toBeNull();
+    expect(a.dropped).toBe(1);
   });
 
   test('expires a stale partial column (seq wrap)', () => {
@@ -334,7 +335,7 @@ describe('PingAssembler', () => {
     expect(a.push(parsePingData(segment({ seq: 8, seg: 0, count: 1, total: 2, offset: 0, data: [5, 6] })), 0)).toBeNull();
     const col = a.addResults({ seq: 8, channel: 1, rangeStartCm: 0, rangeEndCm: 700 }, 10)!;
     expect([...col.samples]).toEqual([5, 6]);
-    expect(col.results!.channel).toBe(1);
+    expect(col.results.channel).toBe(1);
   });
 
   test('does not pair with stale results or a stale waiting column', () => {
@@ -379,8 +380,8 @@ describe('PingAssembler', () => {
     for (let i = 0; i < 33; i++) a.addResults({ seq: i, channel: 0, rangeStartCm: 0, rangeEndCm: 100 + i }, 0);
     expect(a.push(parsePingData(segment({ seq: 0, seg: 0, count: 1, total: 1, offset: 0, data: [1] })), 1)).toBeNull(); // evicted
     const col = a.push(parsePingData(segment({ seq: 1, seg: 0, count: 1, total: 1, offset: 0, data: [1] })), 1)!;
-    expect(col.results!.rangeEndCm).toBe(101);
+    expect(col.results.rangeEndCm).toBe(101);
     const last = a.push(parsePingData(segment({ seq: 32, seg: 0, count: 1, total: 1, offset: 0, data: [1] })), 1)!;
-    expect(last.results!.rangeEndCm).toBe(132);
+    expect(last.results.rangeEndCm).toBe(132);
   });
 });

@@ -1,20 +1,18 @@
 import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { ReplayTransport, MAX_REPLAY_BYTES } from '../src/replay';
 import { encodeRecord } from '../src/rawlog';
-import { MsgId } from '../src/sonar4';
-import { msg } from './helpers';
+import { bottomMsg, escapeRe, tempDir } from './helpers';
 
 let dir: string;
-beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wifish-replay-')); });
+beforeEach(() => { dir = tempDir('wifish-replay-'); });
 afterEach(() => { vi.useRealTimers(); fs.rmSync(dir, { recursive: true, force: true }); });
 
 /** Capture file of bottom records at the given timestamps (depth = index). */
 function capture(name: string, ts: number[], tail: Buffer = Buffer.alloc(0)): string {
   const file = path.join(dir, name);
-  fs.writeFileSync(file, Buffer.concat([...ts.map((t, i) => encodeRecord(1, msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(i, 17)), t)), tail]));
+  fs.writeFileSync(file, Buffer.concat([...ts.map((t, i) => encodeRecord(1, bottomMsg(i), t)), tail]));
   return file;
 }
 
@@ -80,7 +78,7 @@ describe('ReplayTransport', () => {
 
   test('stops at a truncated tail record', async () => {
     vi.useFakeTimers();
-    const whole = encodeRecord(1, msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(99, 17)), 300);
+    const whole = encodeRecord(1, bottomMsg(99), 300);
     const file = capture('c.bin', [0, 100], whole.subarray(0, 20));
     const t = new ReplayTransport(file);
     const w = watch(t);
@@ -104,7 +102,7 @@ describe('ReplayTransport', () => {
     t = new ReplayTransport(missing);
     w = watch(t);
     t.start();
-    expect(await w.offline).toMatch(new RegExp(`^Cannot replay ${missing.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: .*ENOENT`));
+    expect(await w.offline).toMatch(new RegExp(`^Cannot replay ${escapeRe(missing)}: .*ENOENT`));
 
     t = new ReplayTransport(dir);
     w = watch(t);

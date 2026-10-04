@@ -7,7 +7,7 @@ import {
   VERSION, MsgId, REQUIRED, PING_CONFIGS, messageId, parseHeader, isWellFormed, parseUnit, parseBottom, parseEnv,
   parseError, parseSystemStatus, parsePingResults, parsePingData, parseChannelSettings, parseSystemSettings,
   buildChannelSettings, buildSystemSettings, PingAssembler,
-  type Unit, type SystemStatus, type ChannelSettings, type SystemSettings, type ChannelSettingsPatch,
+  type Column, type Unit, type SystemStatus, type ChannelSettings, type SystemSettings, type ChannelSettingsPatch,
   type SystemSettingsPatch, type ChannelId,
 } from './sonar4';
 
@@ -34,6 +34,8 @@ interface Pending<T, P> extends Held<T> {
    * rebuilt on whatever the sonar holds now (another client may have changed it meanwhile).
    */
   patch: P;
+  /** Rebuild this change on `held` (what the sonar broadcast last) at its seq + 1. */
+  rebuild: (held: Held<T>) => Held<T>;
 }
 
 /** Resend an unconfirmed settings change after this long (UDP may drop it). */
@@ -54,10 +56,22 @@ export interface SessionEvents {
 }
 
 /** Byte-for-byte equality of two datagrams. */
-const sameBytes = (a: Uint8Array, b: Uint8Array): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
+const sameBytes = (a: Uint8Array, b: Uint8Array): boolean => Buffer.compare(a, b) === 0;
+
+/** A channel settings change `patch` built on `held`, at its seq + 1. */
+function channelCommand(held: Held<ChannelSettings>, patch: ChannelSettingsPatch): Held<ChannelSettings> {
+  const raw = buildChannelSettings(held.raw, patch, held.parsed.seq + 1);
+  return { raw, parsed: parseChannelSettings(raw)! };
+}
+/** A system settings change `patch` built on `held`, at its seq + 1. */
+function systemCommand(held: Held<SystemSettings>, patch: SystemSettingsPatch): Held<SystemSettings> {
+  const raw = buildSystemSettings(held.raw, patch, held.parsed.seq + 1);
+  return { raw, parsed: parseSystemSettings(raw)! };
+}
 
 export class Sonar4Session extends EventEmitter<SessionEvents> {
-  readonly seen = new Map<number, number>();
+  /** Message ids received in this connection (for `ready`). */
+  readonly seen = new Set<number>();
   asm = new PingAssembler();
   unit: Unit | null = null;
   bottomCm: number | null = null;
@@ -73,6 +87,12 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
   /** Ping configuration index last seen per channel (0 = sonar, 1 = DownVision). */
   readonly configIndex: [number | null, number | null] = [null, null];
   #warned = new Set<string>();
+  /**
+   * After a link loss the next broadcast of each setting replaces what we hold whatever its
+   * seq: a unit that rebooted meanwhile restarts its seqs lower and would otherwise be ignored.
+   */
+  #resyncSystem = false;
+  #resyncChannels = new Set<number>();
 
   /** System settings: our unconfirmed change if any, else the device's; null before any arrived. */
   get system(): SystemSettings | null {
@@ -112,7 +132,19 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
     this.#pendingSystem = null;
     this.#pendingChannels.clear();
     this.#warned.clear();
+    this.#resyncSystem = false;
+    this.#resyncChannels.clear();
     this.asm = new PingAssembler();
+  }
+
+  /**
+   * The link was lost: the sonar may restart before it comes back. Accept the next broadcast
+   * of every setting held now even when its seq is not newer (the app resets its decoders on
+   * reconnect; this keeps what we hold until the replacement arrives).
+   */
+  resync(): void {
+    this.#resyncSystem = this.#system !== null;
+    this.#resyncChannels = new Set(this.#channels.keys());
   }
 
   /** Forget the bottom depth and water temperature without emitting (the link dropped; the app blanks both). */
@@ -141,13 +173,12 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
     }
     const h = parseHeader(b);
     if (!h) return null;
-    const hex = `0x${h.id.toString(16)}`;
     if (h.version !== VERSION) {
-      this.#warnOnce(`ver${h.id}`, `${hex} protocol version ${h.version} != ${VERSION}, ignored`);
+      this.#warnOnce(`ver${h.id}`, `0x${h.id.toString(16)} protocol version ${h.version} != ${VERSION}, ignored`);
       return null;
     }
     if (!isWellFormed(b, h)) {
-      this.#warnOnce(`len${h.id}`, `${hex} malformed (${b.length} bytes, header says ${h.length}), dropping these`);
+      this.#warnOnce(`len${h.id}`, `0x${h.id.toString(16)} malformed (${b.length} bytes, header says ${h.length}), dropping these`);
       return null;
     }
     let ok = true;
@@ -175,8 +206,9 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
       case MsgId.SYS_SETTINGS: {
         const s = parseSystemSettings(b);
         if (!s) { ok = false; break; }
-        // Like the app: only a newer seq replaces what we hold.
-        const newer = !this.#system || s.seq > this.#system.parsed.seq;
+        // Like the app: only a newer seq replaces what we hold (any seq right after a link loss).
+        const newer = !this.#system || s.seq > this.#system.parsed.seq || this.#resyncSystem;
+        this.#resyncSystem = false;
         if (newer) this.#system = { parsed: s, raw: Uint8Array.from(b) };
         const p = this.#pendingSystem;
         if (p && s.seq >= p.parsed.seq) {
@@ -194,7 +226,7 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
         const s = parseChannelSettings(b);
         if (!s) { ok = false; this.#warnOnce('chanset', 'channel settings with bad size or index, ignored'); break; }
         const held = this.#channels.get(s.index);
-        const newer = !held || s.seq > held.parsed.seq;
+        const newer = !held || s.seq > held.parsed.seq || this.#resyncChannels.delete(s.index);
         if (newer) this.#channels.set(s.index, { parsed: s, raw: Uint8Array.from(b) });
         const p = this.#pendingChannels.get(s.index);
         if (p && s.seq >= p.parsed.seq) {
@@ -210,23 +242,23 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
       case MsgId.PING_RESULTS: {
         // Results may follow their ping data; the assembler hands back the waiting column.
         const col = this.asm.addResults(parsePingResults(b), now);
-        if (col) this.#column(col.results, col.setting, col.seq, col.samples);
+        if (col) this.#column(col);
         break;
       }
       case MsgId.PING_DATA: {
         const col = this.asm.push(parsePingData(b), now);
-        if (col) this.#column(col.results, col.setting, col.seq, col.samples);
+        if (col) this.#column(col);
         break;
       }
     }
-    if (ok) this.seen.set(h.id, (this.seen.get(h.id) ?? 0) + 1);
+    if (ok) this.seen.add(h.id);
     return ok ? h.id : null;
   }
 
   /** Emit a completed column for an enabled configuration, with its view window from the channel's range settings. */
-  #column(r: ReturnType<typeof parsePingResults>, configIndex: number, seq: number, samples: Uint8Array): void {
-    if (!r || (r.channel !== 0 && r.channel !== 1)) return; // can't tell which trace it belongs to
-    const channel = r.channel as ChannelId;
+  #column({ results: r, setting: configIndex, seq, samples }: Column): void {
+    if (r.channel !== 0 && r.channel !== 1) return; // can't tell which trace it belongs to
+    const channel: ChannelId = r.channel;
     const cs = this.channelSettings(configIndex);
     // The app draws only configurations whose settings it holds as enabled (e0.f.n()).
     if (!cs || !cs.enabled) return;
@@ -262,9 +294,9 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
       const prev = this.#pendingChannels.get(idx);
       const base = prev ?? this.#channels.get(idx);
       if (!base) continue;
-      const raw = buildChannelSettings(base.raw, p, base.parsed.seq + 1);
-      const parsed = parseChannelSettings(raw)!;
-      this.#pendingChannels.set(idx, { parsed, raw, sentAt: now, sends: 1, stale: false, patch: { ...prev?.patch, ...p } });
+      const patch = { ...prev?.patch, ...p };
+      const { raw, parsed } = channelCommand(base, p);
+      this.#pendingChannels.set(idx, { parsed, raw, sentAt: now, sends: 1, stale: false, patch, rebuild: (h) => channelCommand(h, patch) });
       this.emit('channelSettings', parsed);
       out.push(raw);
     }
@@ -276,9 +308,9 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
     const prev = this.#pendingSystem;
     const base = prev ?? this.#system;
     if (!base) return null;
-    const raw = buildSystemSettings(base.raw, patch, base.parsed.seq + 1);
-    const parsed = parseSystemSettings(raw)!;
-    this.#pendingSystem = { parsed, raw, sentAt: now, sends: 1, stale: false, patch: { ...prev?.patch, ...patch } };
+    const all = { ...prev?.patch, ...patch };
+    const { raw, parsed } = systemCommand(base, patch);
+    this.#pendingSystem = { parsed, raw, sentAt: now, sends: 1, stale: false, patch: all, rebuild: (h) => systemCommand(h, all) };
     this.emit('systemSettings', parsed);
     return raw;
   }
@@ -294,12 +326,12 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
    */
   retryPending(now = Date.now()): Uint8Array[] {
     const out: Uint8Array[] = [];
-    /** Resend `p` (rebuilt on `held` when stale), or report that it is to be dropped (true). */
-    const step = <T, P>(p: Pending<T, P>, held: Held<T> | null, build: (held: Held<T>, patch: P) => Held<T>, event: () => void): boolean => {
+    /** Resend `p` (rebuilt on `held` when stale, emitting `event`); true when it is to be dropped instead. */
+    const step = <T, P>(p: Pending<T, P>, held: Held<T> | null, event: () => void): boolean => {
       if (!p.stale && now - p.sentAt < RESEND_MS) return false;
       if (p.sends >= MAX_SENDS) return p.stale;
       if (p.stale && held) {
-        const fresh = build(held, p.patch);
+        const fresh = p.rebuild(held);
         if (!sameBytes(fresh.raw, p.raw)) {
           p.raw = fresh.raw;
           p.parsed = fresh.parsed;
@@ -314,26 +346,16 @@ export class Sonar4Session extends EventEmitter<SessionEvents> {
     };
     for (const [idx, p] of this.#pendingChannels) {
       const held = this.#channels.get(idx) ?? null;
-      const build = (h: Held<ChannelSettings>, patch: ChannelSettingsPatch): Held<ChannelSettings> => {
-        const raw = buildChannelSettings(h.raw, patch, h.parsed.seq + 1);
-        return { raw, parsed: parseChannelSettings(raw)! };
-      };
-      if (!step(p, held, build, () => this.emit('channelSettings', p.parsed))) continue;
+      if (!step(p, held, () => this.emit('channelSettings', p.parsed))) continue;
       this.#pendingChannels.delete(idx);
       this.emit('warn', `sonar did not apply the settings change for ping configuration ${idx}; showing its own values`);
       if (held) this.emit('channelSettings', held.parsed);
     }
     const ps = this.#pendingSystem;
-    if (ps) {
-      const build = (h: Held<SystemSettings>, patch: SystemSettingsPatch): Held<SystemSettings> => {
-        const raw = buildSystemSettings(h.raw, patch, h.parsed.seq + 1);
-        return { raw, parsed: parseSystemSettings(raw)! };
-      };
-      if (step(ps, this.#system, build, () => this.emit('systemSettings', ps.parsed))) {
-        this.#pendingSystem = null;
-        this.emit('warn', 'sonar did not apply the system settings change; showing its own values');
-        if (this.#system) this.emit('systemSettings', this.#system.parsed);
-      }
+    if (ps && step(ps, this.#system, () => this.emit('systemSettings', ps.parsed))) {
+      this.#pendingSystem = null;
+      this.emit('warn', 'sonar did not apply the system settings change; showing its own values');
+      if (this.#system) this.emit('systemSettings', this.#system.parsed);
     }
     return out;
   }

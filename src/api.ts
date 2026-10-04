@@ -11,13 +11,14 @@
 //   POST api/vessel            VesselSettings patch
 //
 // Under Signal K the GETs are registered for readonly users and the POSTs for readwrite
-// users (plugin.ts). A readonly principal that still reaches a POST (a server without
-// per-route plugin access) gets 403, and sees canControl false in every state it is sent.
+// users (plugin.ts); on a server without per-route plugin access every route is admin-only.
+// A readonly principal sees canControl false in every state it is sent, and a POST that
+// reaches the API with one anyway (defence in depth) gets 403.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { Engine } from './engine';
+import type { Engine, HistoryEntry } from './engine';
 import { DisplayStore, VesselStore, parseDisplayPatch, parseVesselPatch } from './store';
-import { CHANNELS, isChannelName, type ChannelName, type ChannelPatch, type ColumnMessage, type SystemPatch, type WifishState } from './shared/api';
+import { isChannelName, type ChannelName, type ChannelPatch, type SystemPatch, type WifishState } from './shared/api';
 import { MAX_RANGE_CM, MAX_TRANSDUCER_OFFSET_CM, MIN_RANGE_WINDOW_CM } from './shared/units';
 import { errorMessage } from './util';
 
@@ -47,7 +48,7 @@ export const MAX_BODY_BYTES = 16 * 1024;
 /** SSE comment keeping idle streams alive through proxies. */
 const PING_MS = 15_000;
 
-/** The Signal K principal may look but not change anything. */
+/** The Signal K principal may look but not change anything (anonymous readonly access included). */
 const isReadonly = (req: Req): boolean => req.skIsAuthenticated === true && req.skPrincipal?.permissions === 'readonly';
 
 /** Send a JSON response with the given status, marked uncacheable. */
@@ -147,33 +148,27 @@ function channelRoute(path: string): ChannelName | null {
   return isChannelName(ch) ? ch : null;
 }
 
+/** SSE frame for already serialised data. */
+const rawFrame = (event: string, json: string): string => `event: ${event}\ndata: ${json}\n\n`;
 /** One SSE frame. */
-const frame = (event: string, data: unknown): string => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+const frame = (event: string, data: unknown): string => rawFrame(event, JSON.stringify(data));
 const LIVE_FRAME = frame('live', null);
-/** Column frames, serialised once however many viewers receive them (now or from the backlog). */
-const colFrames = new WeakMap<ColumnMessage, string>();
-/** SSE frame for a column. */
-function colFrame(c: ColumnMessage): string {
-  let f = colFrames.get(c);
-  if (f === undefined) {
-    f = frame('col', c);
-    colFrames.set(c, f);
-  }
-  return f;
-}
 
-/** Interleave both channels' backlogs by time so the viewer rebuilds history in order. */
-export function backlog(engine: Pick<Engine, 'history'>): ColumnMessage[] {
-  return CHANNELS.flatMap((c) => engine.history(c)).sort((a, b) => a.t - b.t);
-}
-
-/** Frames of the newest backlog columns that fit in `maxBytes`, oldest first. */
+/**
+ * Frames of the newest backlog columns that fit in `maxBytes`, oldest first, both channels
+ * interleaved by time so the viewer rebuilds history in order. Each channel's history is
+ * already in time order: a merge from the newest end stops at the budget instead of sorting
+ * the whole history.
+ */
 export function backlogFrames(engine: Pick<Engine, 'history'>, maxBytes = MAX_BACKLOG_BYTES): string[] {
-  const cols = backlog(engine);
+  const a = engine.history('sonar'), b = engine.history('downvision');
+  let i = a.length - 1, j = b.length - 1;
   const out: string[] = [];
   let bytes = 0;
-  for (let i = cols.length - 1; i >= 0; i--) {
-    const f = colFrame(cols[i]);
+  while (i >= 0 || j >= 0) {
+    // Newest first; on equal times DownVision, so the forward order puts sonar first.
+    const e: HistoryEntry = j < 0 || (i >= 0 && a[i].t > b[j].t) ? a[i--] : b[j--];
+    const f = rawFrame('col', e.json);
     bytes += f.length; // JSON of a column is ASCII: one byte per char
     if (bytes > maxBytes) break;
     out.push(f);
@@ -303,8 +298,8 @@ export class Api {
     }
     /** Forward engine state changes to every viewer. */
     const onState = (s: WifishState) => this.#broadcast('state', s);
-    /** Forward each new echogram column to every viewer. */
-    const onCol = (c: ColumnMessage) => this.#broadcast('col', c);
+    /** Forward each new echogram column, serialised once by the engine, to every viewer. */
+    const onCol = (_c: unknown, json: string) => this.#broadcastFrame(rawFrame('col', json));
     engine.on('state', onState);
     engine.on('column', onCol);
     this.#unsub = () => { engine.off('state', onState); engine.off('column', onCol); };
@@ -346,10 +341,11 @@ export class Api {
     res.flushHeaders?.();
     const client: Client = { res, readonly: isReadonly(req), queue: [], queued: 0, ping: null };
     this.#clients.set(res, client);
-    /** Forget the viewer once its connection closes. */
-    const done = () => this.#forget(client);
-    req.on('close', done);
-    res.on('close', done);
+    // The response closes when the viewer goes away or the stream ends ('close' on the request
+    // can also mean only that its body was read).
+    res.on('close', () => this.#forget(client));
+    // An 'error' with no listener would take the server down; the stream is simply dropped.
+    res.on('error', (e) => { this.#error(`event stream: ${errorMessage(e)}`); this.#drop(client); });
     const engine = this.#engine();
     const head = [
       'retry: 2000\n\n',
@@ -427,14 +423,20 @@ export class Api {
   /** Send an event to every viewer, dropping any whose unread output exceeds its budget. */
   #broadcast(event: string, data: unknown): void {
     if (!this.#clients.size) return;
-    const f = event === 'col' ? colFrame(data as ColumnMessage) : frame(event, data);
     /** The same state for readonly viewers, built once if any needs it. */
     let ro: string | null = null;
-    for (const c of [...this.#clients.values()]) {
+    const readonly = event === 'state' && data ? () => (ro ??= frame('state', { ...(data as WifishState), canControl: false })) : undefined;
+    this.#broadcastFrame(frame(event, data), readonly);
+  }
+
+  /** Send a frame to every viewer (`readonly()` instead to readonly viewers, when given). */
+  #broadcastFrame(f: string, readonly?: () => string): void {
+    if (!this.#clients.size) return;
+    for (const c of this.#clients.values()) { // deleting the current entry while iterating a Map is safe
       if (!this.#alive(c)) { this.#forget(c); continue; }
       // A viewer that stopped reading (stalled proxy, suspended tab) would buffer forever.
       if (c.res.writableLength + c.queued > MAX_UNREAD_BYTES) { this.#drop(c); continue; }
-      const out = event === 'state' && c.readonly && data ? (ro ??= frame('state', { ...(data as WifishState), canControl: false })) : f;
+      const out = c.readonly && readonly ? readonly() : f;
       if (c.queue) {
         c.queue.push(out);
         c.queued += out.length;

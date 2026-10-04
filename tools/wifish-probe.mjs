@@ -18,9 +18,9 @@ import {
 import { PATH, centiCToK, depthValues, toDelta, Throttle } from '../dist/signalk.js';
 import { CHANNEL, encodeRecord, readRawLog } from '../dist/rawlog.js';
 
-// Lost / give-up timing shared with the plugin's transport (src/device.ts) so the two cannot
-// drift apart. Older builds of dist/device.js do not export TIMING; the defaults mirror its values.
-const { TIMING = { RETRY_MS: 5000, QUIET_MS: 3000, GIVE_UP_MS: 20_000 } } = await import('../dist/device.js');
+// Lost / give-up timing and the interface choice are shared with the plugin's transport
+// (src/device.ts), so the two cannot drift apart.
+import { TIMING, candidatesFrom, ifacesFor } from '../dist/device.js';
 
 const USAGE = `Usage: wifish-probe [options]
   --iface <ipv4>     local WLAN address (default: the 192.x address on the sonar's subnet)
@@ -200,21 +200,16 @@ if (opts.replay) {
 // The probe keeps its own discovery / data / control sockets instead of using the plugin's
 // DeviceTransport on purpose: --log must tag every datagram as a discovery or data record
 // (CHANNEL.DISCOVERY / CHANNEL.DATA, which dump-raw and the replay transport rely on), and
-// DeviceTransport does not expose which socket a message came in on. Only the timing
-// constants (TIMING, above) are shared with it.
-// Candidates as the app picks them (IPv4 starting with 192.), unless --iface is given.
-const candidates = opts.iface
-  ? [{ address: opts.iface, netmask: null }]
-  : Object.values(os.networkInterfaces()).flat()
-    .filter((a) => a && a.family === 'IPv4' && !a.internal && a.address.startsWith('192.'));
-if (!candidates.length) { console.error('No 192.x interface; pass --iface'); process.exit(1); }
-
-const toInt = (ip) => ip.split('.').reduce((n, o) => (n << 8) | Number(o), 0) >>> 0;
-const sameSubnet = (a, b, mask) => ((toInt(a) & toInt(mask)) >>> 0) === ((toInt(b) & toInt(mask)) >>> 0);
-function ifaceFor(device) {
-  if (candidates.length === 1) return candidates[0].address;
-  return candidates.find((c) => sameSubnet(c.address, device, c.netmask))?.address;
+// DeviceTransport does not expose which socket a message came in on. The timing constants
+// and the interface choice (TIMING, candidatesFrom, ifacesFor) are shared with it.
+// Candidates as the plugin picks them (the 192.x addresses when there are any), unless --iface is given.
+const candidates = candidatesFrom(os.networkInterfaces(), opts.iface);
+if (!candidates.length) {
+  console.error(opts.iface ? `No interface has the address ${opts.iface}` : 'No IPv4 network interface; join the sonar Wi-Fi or pass --iface');
+  process.exit(1);
 }
+/** The interface to use for `device`: the best of the plugin's choices. */
+const ifaceFor = (device) => ifacesFor(candidates, device)[0];
 console.log(`[init] candidate interfaces: ${candidates.map((c) => c.address).join(', ')}`);
 
 function fatal(where) {

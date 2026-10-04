@@ -1,7 +1,7 @@
 import { describe, test, expect } from 'vitest';
 import { Sonar4Session, MAX_SENDS, RESEND_MS, type SessionColumn } from '../src/session';
 import { MsgId, CS, SS, parseChannelSettings, parseSystemSettings } from '../src/sonar4';
-import { msg, segment, results, channelSettings, systemSettings } from './helpers';
+import { msg, segment, results, channelSettings, systemSettings, bottomMsg, envMsg, unitMsg } from './helpers';
 
 function columns(s: Sonar4Session): SessionColumn[] {
   const out: SessionColumn[] = [];
@@ -57,9 +57,8 @@ describe('Sonar4Session', () => {
   test('reset forgets results, unit and readings from the previous connection', () => {
     const s = new Sonar4Session();
     const cols = columns(s);
-    const unit = Buffer.alloc(52); unit.writeUInt32LE(1, 0); unit.writeUInt32LE(67, 4);
-    s.handle(unit);
-    s.handle(msg(MsgId.ENV, 68, (b) => b.writeInt16LE(1530, 28)));
+    s.handle(unitMsg(67));
+    s.handle(envMsg(1530));
     s.handle(results(1, 1, 0, 5000));
     s.handle(msg(MsgId.SYS_STATUS, 1063));
     expect(s.systemStatus).not.toBeNull();
@@ -94,7 +93,7 @@ describe('Sonar4Session', () => {
 
   test('is ready once the unit, every required message and all 32 ping configurations were seen', () => {
     const s = new Sonar4Session();
-    const unit = Buffer.alloc(52); unit.writeUInt32LE(1, 0); unit.writeUInt32LE(67, 4);
+    const unit = unitMsg(67);
     s.handle(msg(MsgId.ENV, 68));
     s.handle(msg(MsgId.ERROR, 20));
     s.handle(msg(MsgId.SYS_STATUS, 1063));
@@ -261,8 +260,8 @@ describe('Sonar4Session', () => {
     let events = 0;
     s.on('bottom', () => events++);
     s.on('temperature', () => events++);
-    s.handle(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(1234, 17)));
-    s.handle(msg(MsgId.ENV, 68, (b) => b.writeInt16LE(1530, 28)));
+    s.handle(bottomMsg(1234));
+    s.handle(envMsg(1530));
     expect(events).toBe(2);
     s.clearReadings();
     expect(s.bottomCm).toBeNull();
@@ -294,14 +293,11 @@ describe('Sonar4Session', () => {
 
   test('decodes unit, bottom and temperature events', () => {
     const s = new Sonar4Session();
-    const unit = Buffer.alloc(52);
-    unit.writeUInt32LE(1, 0); unit.writeUInt32LE(67, 4); unit.write('DF4', 20, 'latin1');
-    s.handle(unit);
-    s.handle(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(1234, 17)));
-    s.handle(msg(MsgId.ENV, 68, (b) => b.writeInt16LE(1530, 28)));
+    s.handle(unitMsg(67, 'DF4'));
+    s.handle(bottomMsg(1234));
+    s.handle(envMsg(1530));
     expect(s.unit).toMatchObject({ type: 67, name: 'DF4' });
     expect(s.bottomCm).toBe(1234);
     expect(s.waterTempCentiC).toBe(1530);
-    expect(CS.GAIN).toBe(79);
   });
 });

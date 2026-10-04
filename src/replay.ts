@@ -2,7 +2,7 @@
 
 import fs from 'node:fs';
 import { EventEmitter } from 'node:events';
-import { readRawLog, type RawRecord } from './rawlog';
+import { RECORD_HEADER, readRawLog, recordAt } from './rawlog';
 import type { Transport, TransportEvents } from './transport';
 import { errorMessage } from './util';
 
@@ -17,7 +17,9 @@ export class ReplayTransport extends EventEmitter<TransportEvents> implements Tr
   readonly kind = 'replay' as const;
   readonly canSend = false;
   #file: string;
-  #records: RawRecord[] = [];
+  /** The capture, and where each complete record starts in it (no object per record kept). */
+  #buf = Buffer.alloc(0);
+  #offsets = new Uint32Array(0);
   #i = 0;
   #timer: NodeJS.Timeout | null = null;
   #running = false;
@@ -63,13 +65,16 @@ export class ReplayTransport extends EventEmitter<TransportEvents> implements Tr
     if (st.size > MAX_REPLAY_BYTES) throw new Error(`${st.size} bytes is over the ${MAX_REPLAY_BYTES / 1024 / 1024} MiB limit`);
     const buf = await fs.promises.readFile(this.#file);
     if (gen !== this.#gen) return; // stopped (or restarted) while reading
-    const records: RawRecord[] = [];
+    const offsets: number[] = [];
+    let o = 0;
     for (const r of readRawLog(buf)) {
       if ('truncated' in r) break;
-      records.push(r);
+      offsets.push(o);
+      o += RECORD_HEADER + r.msg.length;
     }
-    if (!records.length) return this.#fail(gen, `${this.#file} has no records`);
-    this.#records = records;
+    if (!offsets.length) return this.#fail(gen, `${this.#file} has no records`);
+    this.#buf = buf;
+    this.#offsets = Uint32Array.from(offsets); // the file is at most MAX_REPLAY_BYTES
     this.#i = 0;
     this.emit('link', 'connected', `Replaying ${this.#file}`);
     this.#next();
@@ -90,10 +95,10 @@ export class ReplayTransport extends EventEmitter<TransportEvents> implements Tr
    */
   #next(): void {
     if (!this.#running) return;
-    const r = this.#records[this.#i];
+    const r = recordAt(this.#buf, this.#offsets[this.#i]);
     this.emit('datagram', r.msg);
-    this.#i = (this.#i + 1) % this.#records.length;
-    const nxt = this.#records[this.#i];
+    this.#i = (this.#i + 1) % this.#offsets.length;
+    const nxt = recordAt(this.#buf, this.#offsets[this.#i]);
     const wrap = this.#i === 0;
     const gap = wrap ? LOOP_GAP_MS : Math.min(MAX_GAP_MS, Math.max(0, nxt.ts - r.ts));
     this.#timer = setTimeout(() => {

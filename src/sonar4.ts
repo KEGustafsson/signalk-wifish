@@ -3,7 +3,6 @@
 // null when the datagram is too short / not the expected message.
 
 import { MAX_TRANSDUCER_OFFSET_CM, MAX_RANGE_CM } from './shared/units';
-export { MAX_TRANSDUCER_OFFSET_CM } from './shared/units';
 
 export const VERSION = 116;
 export const DISCOVERY = { group: '224.0.0.1', port: 5800 } as const;
@@ -71,13 +70,10 @@ const latin1 = new TextDecoder('latin1');
  * (PROTOCOL.md §6), so nothing about their content is trusted.
  */
 function cstr(b: Uint8Array, from: number, to: number): string {
-  const stop = Math.min(to, b.length);
-  const keep: number[] = [];
-  for (let i = from; i < stop && b[i] !== 0; i++) {
-    const c = b[i];
-    if (c >= 0x20 && (c < 0x7f || c > 0x9f)) keep.push(c);
-  }
-  return latin1.decode(Uint8Array.from(keep)).trim();
+  const field = b.subarray(from, Math.min(to, b.length));
+  const nul = field.indexOf(0);
+  // Bytes are filtered before decoding: the 'latin1' decoder is windows-1252, which maps 0x80..0x9f to printable characters.
+  return latin1.decode((nul < 0 ? field : field.subarray(0, nul)).filter((c) => c >= 0x20 && (c < 0x7f || c > 0x9f))).trim();
 }
 
 /** True for a message id of the 0x2701xx (sonar data and settings) family; discovery ids 0 and 1 are not. */
@@ -121,7 +117,7 @@ const validPort = (p: number) => Number.isInteger(p) && p > 0 && p < 65536;
 export function checkService(s: Announce | null, sender?: string): string | null {
   if (!s) return 'malformed';
   const first = Number(s.group.split('.')[0]);
-  if (first < 224 || first > 239) return `data group ${s.group} is not multicast`;
+  if (!(first >= 224 && first <= 239)) return `data group ${s.group} is not multicast`;
   if (!validPort(s.port)) return `bad data port ${s.port}`;
   if (!validPort(s.ctrlPort)) return `bad control port ${s.ctrlPort}`;
   if (sender !== undefined && sender !== s.device) return `device ${s.device} != sender ${sender}`;
@@ -353,7 +349,7 @@ export interface Column {
   setting: number;
   samples: Uint8Array;
   filled: number;
-  results: PingResults | null;
+  results: PingResults;
 }
 
 interface Partial_ { buf: Uint8Array; next: number; filled: number; t: number; dataType: number; setting: number }
@@ -374,7 +370,8 @@ interface Partial_ { buf: Uint8Array; next: number; filled: number; t: number; d
 export class PingAssembler {
   #pings = new Map<number, Partial_>();
   #results = new Map<number, { r: PingResults; t: number }>();
-  #waiting = new Map<number, { col: Column; t: number }>();
+  /** Complete columns waiting for their results. */
+  #waiting = new Map<number, { col: Omit<Column, 'results'>; t: number }>();
   dropped = 0;
   readonly staleMs: number;
 
@@ -392,7 +389,7 @@ export class PingAssembler {
     const w = this.#waiting.get(r.seq);
     if (w) {
       this.#waiting.delete(r.seq);
-      if (now - w.t <= this.staleMs) return { ...w.col, results: r };
+      if (now - w.t <= this.staleMs) return Object.assign(w.col, { results: r });
     }
     this.#results.delete(r.seq);
     this.#results.set(r.seq, { r, t: now });
@@ -404,7 +401,8 @@ export class PingAssembler {
   push(s: PingSegment | null, now = Date.now()): Column | null {
     if (!s) return null;
     if (s.error !== 0 || s.count === 0 || s.segment >= s.count
-        || s.total === 0 || s.total > MAX_COLUMN || s.offset + s.samples.length > s.total) {
+        || s.total === 0 || s.total > MAX_COLUMN || s.offset + s.samples.length > s.total
+        || (s.segment === 0 && s.offset !== 0)) {
       return this.#drop(s.seq);
     }
     let p = this.#pings.get(s.seq);
@@ -419,16 +417,16 @@ export class PingAssembler {
     p.next++;
     if (s.segment !== s.count - 1) return null;
     this.#pings.delete(s.seq);
-    const col: Column = {
+    const col = {
       seq: s.seq, dataType: p.dataType, setting: p.setting,
       // The app scales the column over the bytes it received (e0.e.f()), not the announced total.
       samples: p.filled >= p.buf.length ? p.buf : p.buf.subarray(0, p.filled),
-      filled: p.filled, results: null,
+      filled: p.filled,
     };
     const res = this.#results.get(s.seq);
     if (res && now - res.t <= this.staleMs) {
       this.#results.delete(s.seq);
-      return { ...col, results: res.r };
+      return Object.assign(col, { results: res.r });
     }
     this.#waiting.set(s.seq, { col, t: now });
     for (const [k, w] of this.#waiting) if (now - w.t > this.staleMs) this.#waiting.delete(k);

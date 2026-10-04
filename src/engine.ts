@@ -28,9 +28,13 @@ export interface EngineOptions {
   error?: (msg: string) => void;
 }
 
+/** A column kept for viewers that connect later: when it arrived and its ColumnMessage as JSON, serialised once. */
+export interface HistoryEntry { readonly t: number; readonly json: string }
+
 export interface EngineEvents {
   state: [WifishState];
-  column: [ColumnMessage];
+  /** A new column and its JSON (the same string its history entry holds). */
+  column: [ColumnMessage, string];
 }
 
 /** The app keeps showing the last depth this long after bottom lock is lost (msg 105). */
@@ -70,18 +74,25 @@ export class Engine extends EventEmitter<EngineEvents> {
   #error: (msg: string) => void;
   #link: LinkState = 'offline';
   #message = 'Starting';
-  #history: Record<ChannelName, ColumnMessage[]> = { sonar: [], downvision: [] };
+  #history: Record<ChannelName, HistoryEntry[]> = { sonar: [], downvision: [] };
   #n: Record<ChannelName, number> = { sonar: 0, downvision: 0 };
   #throttles = {
     depth: new Throttle({ minIntervalMs: DEPTH_MIN_INTERVAL_MS, heartbeatMs: DEPTH_HEARTBEAT_MS }),
     temp: new Throttle({ minIntervalMs: TEMP_MIN_INTERVAL_MS, heartbeatMs: TEMP_HEARTBEAT_MS }),
   };
   #stateTimer: NodeJS.Timeout | null = null;
+  /** The last state emitted, as JSON: an unchanged state is not sent again. */
+  #lastState = '';
   #watchdog: NodeJS.Timeout | null = null;
+  /** Sends a reading the rate limit held back as soon as it may go out. */
+  #flushTimer: NodeJS.Timeout | null = null;
+  #flushAt = 0;
   #lastData: number | null = null;
   #stale = false;
   /** Depth paths currently published, so ones that stop applying can be cleared. */
   #depthPaths = new Set<string>();
+  /** The device offset the depth paths were last published with. */
+  #depthOffset: number | null = null;
   #running = false;
   #stopped = false;
   #tempPublished = false;
@@ -92,7 +103,6 @@ export class Engine extends EventEmitter<EngineEvents> {
   /** Wire transport datagrams and link changes into the session, and session events into deltas and state. */
   constructor(transport: Transport, opts: EngineOptions = {}) {
     super();
-    this.setMaxListeners(0);
     this.transport = transport;
     this.#opts = {
       historyColumns: clampColumns(opts.historyColumns),
@@ -127,6 +137,8 @@ export class Engine extends EventEmitter<EngineEvents> {
         // The app blanks depth and water temperature when the connection drops (msg 11/12).
         if (fresh || state === 'lost') this.#clearReadings();
         if (fresh) s.reset();
+        // The sonar may restart before it is back: take its next settings whatever their seq.
+        else if (state === 'lost') s.resync();
         this.#stateChanged(true);
       } catch (e) {
         this.#error(`error handling link '${state}': ${errorMessage(e)}`);
@@ -138,7 +150,11 @@ export class Engine extends EventEmitter<EngineEvents> {
     s.on('temperature', (c) => { this.#temperature(c); this.#stateChanged(); });
     s.on('errorFlags', () => this.#stateChanged());
     s.on('systemStatus', () => this.#stateChanged());
-    s.on('systemSettings', () => { this.#depth(s.bottomCm, true); this.#stateChanged(true); });
+    s.on('systemSettings', () => {
+      // Republish with the offset now confirmed; nothing to do without a bottom and with the same offset.
+      if (s.bottomCm !== null || (s.deviceSystem?.transducerOffsetCm ?? 0) !== this.#depthOffset) this.#depth(s.bottomCm, true);
+      this.#stateChanged(true);
+    });
     s.on('channelSettings', () => this.#stateChanged(true));
     s.on('column', (c) => this.#column(c));
   }
@@ -174,7 +190,7 @@ export class Engine extends EventEmitter<EngineEvents> {
   get message(): string { return this.#message; }
 
   /** Backlog of recent columns for a channel, oldest first. */
-  history(ch: ChannelName): readonly ColumnMessage[] {
+  history(ch: ChannelName): readonly HistoryEntry[] {
     return this.#history[ch];
   }
 
@@ -201,6 +217,7 @@ export class Engine extends EventEmitter<EngineEvents> {
         downvision: view(s.channelSettings(s.indexFor(CHANNEL_CODE.downvision))),
       },
       active: { sonar: this.#n.sonar > 0, downvision: this.#n.downvision > 0 },
+      historyColumns: this.#opts.historyColumns,
     };
   }
 
@@ -248,7 +265,8 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (this.#holdTimer) clearTimeout(this.#holdTimer);
     if (this.#watchdog) clearInterval(this.#watchdog);
     if (this.#stateTimer) clearTimeout(this.#stateTimer);
-    this.#holdTimer = this.#watchdog = this.#stateTimer = null;
+    if (this.#flushTimer) clearTimeout(this.#flushTimer);
+    this.#holdTimer = this.#watchdog = this.#stateTimer = this.#flushTimer = null;
   }
 
   /** Once a second: drop stale readings, send due heartbeats, resend unconfirmed settings. */
@@ -267,14 +285,41 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (now) {
       if (this.#stateTimer) clearTimeout(this.#stateTimer);
       this.#stateTimer = null;
-      this.emit('state', this.state());
+      this.#emitState();
       return;
     }
-    if (this.#stateTimer || this.#stopped) return;
+    if (this.#stateTimer) return;
     this.#stateTimer = setTimeout(() => {
       this.#stateTimer = null;
-      this.emit('state', this.state());
+      this.#emitState();
     }, 250);
+  }
+
+  /** Emit the state unless it is the one emitted last (the sonar re-sends status and temperature every second). */
+  #emitState(): void {
+    const s = this.state();
+    const json = JSON.stringify(s);
+    if (json === this.#lastState) return;
+    this.#lastState = json;
+    this.emit('state', s);
+  }
+
+  /**
+   * Re-feed the held readings once `ms` has passed, so a change the rate limit held back goes
+   * out then. One timer serves depth and temperature: it moves earlier when a sooner flush is due.
+   */
+  #scheduleFlush(ms: number): void {
+    if (!this.#running) return;
+    const at = mono() + ms;
+    if (this.#flushTimer) {
+      if (this.#flushAt <= at) return;
+      clearTimeout(this.#flushTimer);
+    }
+    this.#flushAt = at;
+    this.#flushTimer = setTimeout(() => {
+      this.#flushTimer = null;
+      this.#heartbeat();
+    }, ms);
   }
 
   /** Send the values as one Signal K delta, if there are any; a failing consumer is logged, not propagated. */
@@ -293,6 +338,7 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (cm === null && this.#depthPaths.size === 0) return; // nothing published yet, nothing to clear
     // The sonar applies its own offset to the depth it reports: use its confirmed value, not a pending change.
     const offset = this.session.deviceSystem?.transducerOffsetCm ?? 0;
+    this.#depthOffset = offset;
     const values = depthValues(cm, offset, this.#opts.surfaceToTransducerCm());
     // A path that no longer applies (offset changed sign or went to 0, distance cleared) gets a final null,
     // otherwise the server would keep showing its last value.
@@ -303,7 +349,13 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (force) this.#throttles.depth.reset();
     const now = mono();
     // Each path goes through the throttle; one delta carries all that are due.
-    this.#emitSk([...gone, ...values.filter((v) => this.#throttles.depth.shouldEmit(v.path, v.value, now))]);
+    const throttle = this.#throttles.depth;
+    const due = values.filter((v) => throttle.shouldEmit(v.path, v.value, now));
+    this.#emitSk([...gone, ...due]);
+    for (const v of values) {
+      const wait = due.includes(v) ? null : throttle.holdMs(v.path, v.value, now);
+      if (wait !== null) this.#scheduleFlush(wait);
+    }
   }
 
   /** Publish water temperature in kelvin (throttled); null clears it only once a value was published. */
@@ -312,7 +364,12 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (c === null && !this.#tempPublished) return; // nothing to clear yet
     this.#tempPublished = c !== null;
     const value = c === null ? null : centiCToK(c);
-    if (this.#throttles.temp.shouldEmit(PATH.waterTemp, value, mono())) this.#emitSk([{ path: PATH.waterTemp, value }]);
+    const now = mono();
+    if (this.#throttles.temp.shouldEmit(PATH.waterTemp, value, now)) this.#emitSk([{ path: PATH.waterTemp, value }]);
+    else {
+      const wait = this.#throttles.temp.holdMs(PATH.waterTemp, value, now);
+      if (wait !== null) this.#scheduleFlush(wait);
+    }
   }
 
   /** Watchdog: clear readings once no sonar data has arrived for STALE_MS. */
@@ -328,7 +385,9 @@ export class Engine extends EventEmitter<EngineEvents> {
   /**
    * Heartbeats are timer-driven: the held readings go through the throttles again so a due
    * heartbeat (or a change minInterval suppressed) is sent even when no new sample arrives.
-   * Nothing is re-fed while stale or without readings: null is sent once, not repeated.
+   * Nothing is re-fed while stale or without readings, so a lost link or stale data sends
+   * null once. (A sonar that keeps reporting "no bottom lock" re-sends null itself, and that
+   * goes out at the depth heartbeat like any other unchanged value.)
    */
   #heartbeat(): void {
     if (this.#stale) return;
@@ -367,7 +426,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       this.#stateChanged();
       return;
     }
-    if (this.#holdTimer || this.#shownDepthCm === null || this.#stopped) return;
+    if (this.#holdTimer || this.#shownDepthCm === null) return;
     this.#holdTimer = setTimeout(() => {
       this.#holdTimer = null;
       this.#shownDepthCm = null;
@@ -390,10 +449,15 @@ export class Engine extends EventEmitter<EngineEvents> {
       waterTempCentiC: this.session.waterTempCentiC,
       data: Buffer.from(c.samples.buffer, c.samples.byteOffset, c.samples.byteLength).toString('base64'),
     };
-    const h = this.#history[ch];
-    h.push(msg);
-    if (h.length > this.#opts.historyColumns) h.splice(0, h.length - this.#opts.historyColumns);
+    // History keeps only the JSON: the one form every viewer is sent.
+    const json = JSON.stringify(msg);
+    const max = this.#opts.historyColumns;
+    if (max > 0) {
+      const h = this.#history[ch];
+      h.push({ t: msg.t, json });
+      if (h.length > max) h.splice(0, h.length - max);
+    }
     if (this.#n[ch] === 1) this.#stateChanged(true);
-    this.emit('column', msg);
+    this.emit('column', msg, json);
   }
 }

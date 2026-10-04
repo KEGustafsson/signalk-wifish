@@ -5,7 +5,8 @@ import { DemoDevice } from '../src/demo';
 import { MsgId, messageId, parseChannelSettings } from '../src/sonar4';
 import type { Transport, TransportEvents } from '../src/transport';
 import { PATH, type Delta } from '../src/signalk';
-import { msg, results, segment, channelSettings, systemSettings } from './helpers';
+import type { ColumnMessage } from '../src/shared/api';
+import { msg, results, segment, channelSettings, systemSettings, bottomMsg, envMsg, FAKE_CLOCK } from './helpers';
 
 class FakeTransport extends EventEmitter<TransportEvents> implements Transport {
   readonly kind = 'device' as const;
@@ -33,8 +34,8 @@ describe('Engine', () => {
     const e = new Engine(t, { onDelta: (d) => deltas.push(d) });
     e.start();
     t.feed(systemSettings(1, 50));
-    t.feed(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(1050, 17)));
-    t.feed(msg(MsgId.ENV, 68, (b) => b.writeInt16LE(1234, 28)));
+    t.feed(bottomMsg(1050));
+    t.feed(envMsg(1234));
     const values = deltas.flatMap((d) => d.updates[0].values);
     expect(values).toContainEqual({ path: 'environment.depth.belowTransducer', value: 10 });
     expect(values).toContainEqual({ path: 'environment.depth.belowSurface', value: 10.5 });
@@ -48,7 +49,7 @@ describe('Engine', () => {
     const e = new Engine(t, { onDelta: (d) => deltas.push(d) });
     e.start();
     t.feed(systemSettings(1, 50));
-    t.feed(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(1050, 17)));
+    t.feed(bottomMsg(1050));
     deltas.length = 0;
     t.feed(systemSettings(2, 0));
     const values = deltas.flatMap((d) => d.updates[0].values);
@@ -67,7 +68,7 @@ describe('Engine', () => {
     const e = new Engine(t, { onDelta: (d) => deltas.push(d), surfaceToTransducerCm: () => distance });
     e.start();
     t.feed(systemSettings(1, -30));
-    t.feed(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(970, 17)));
+    t.feed(bottomMsg(970));
     const values = () => deltas.flatMap((d) => d.updates[0].values);
     expect(values()).toContainEqual({ path: 'environment.depth.belowKeel', value: 9.7 });
     expect(values()).toContainEqual({ path: 'environment.depth.transducerToKeel', value: 0.3 });
@@ -86,18 +87,18 @@ describe('Engine', () => {
   });
 
   test('an offset change counts for depth only once the sonar confirms it; the watchdog resends it', () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'Date', 'performance'] });
+    vi.useFakeTimers(FAKE_CLOCK);
     const t = new FakeTransport();
     const deltas: Delta[] = [];
     const e = new Engine(t, { onDelta: (d) => deltas.push(d) });
     e.start();
     t.feed(systemSettings(1, 0));
-    t.feed(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(1050, 17)));
+    t.feed(bottomMsg(1050));
     deltas.length = 0;
     expect(e.setSystem({ transducerOffsetCm: 50 })).toBeNull();
     expect(e.state().system!.transducerOffsetCm).toBe(50); // shown at once
     const paths = () => deltas.flatMap((d) => d.updates[0].values).map((v) => v.path);
-    t.feed(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(1060, 17)));
+    t.feed(bottomMsg(1060));
     expect(paths()).not.toContain('environment.depth.belowSurface');
     // Lost on the way: the sonar keeps its seq 1 settings, the watchdog sends ours again.
     t.sent.length = 0;
@@ -105,7 +106,7 @@ describe('Engine', () => {
     vi.advanceTimersByTime(1000);
     expect(t.sent.filter((b) => messageId(b) === MsgId.SYS_SETTINGS)).toHaveLength(1);
     t.feed(systemSettings(2, 50)); // applied
-    t.feed(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(1070, 17)));
+    t.feed(bottomMsg(1070));
     expect(paths()).toContain('environment.depth.belowSurface');
     e.stop();
   });
@@ -142,8 +143,8 @@ describe('Engine', () => {
     const e = new Engine(t, { onDelta: (d) => deltas.push(d) });
     e.start();
     t.feed(channelSettings(0, 5, { gain: 10 }));
-    t.feed(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(1000, 17)));
-    t.feed(msg(MsgId.ENV, 68, (b) => b.writeInt16LE(1234, 28)));
+    t.feed(bottomMsg(1000));
+    t.feed(envMsg(1234));
     t.emit('link', 'lost', 'lost');
     const values = deltas.flatMap((d) => d.updates[0].values);
     expect(values).toContainEqual({ path: 'environment.depth.belowTransducer', value: null });
@@ -159,11 +160,11 @@ describe('Engine', () => {
   });
 
   test('the readout keeps the last depth for 6 s after bottom lock is lost', () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'Date', 'performance'] });
+    vi.useFakeTimers(FAKE_CLOCK);
     const t = new FakeTransport();
     const e = new Engine(t);
     e.start();
-    const bottom = (cm: number) => t.feed(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(cm, 17)));
+    const bottom = (cm: number) => t.feed(bottomMsg(cm));
     bottom(1000);
     expect(e.state().depthCm).toBe(1000);
     for (let i = 0; i < 5; i++) { vi.advanceTimersByTime(1000); bottom(-0x80000000); }
@@ -180,8 +181,8 @@ describe('Engine', () => {
     const deltas: Delta[] = [];
     const e = new Engine(t, { onDelta: (d) => deltas.push(d), emitDepth: false, emitTemperature: false });
     e.start();
-    t.feed(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(1050, 17)));
-    t.feed(msg(MsgId.ENV, 68, (b) => b.writeInt16LE(1234, 28)));
+    t.feed(bottomMsg(1050));
+    t.feed(envMsg(1234));
     expect(deltas).toHaveLength(0);
     e.stop();
   });
@@ -192,12 +193,12 @@ describe('Engine', () => {
     e.start();
     t.feed(systemSettings(1, 100));
     t.feed(channelSettings(0, 1));
-    t.feed(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(1100, 17)));
+    t.feed(bottomMsg(1100));
     for (let i = 0; i < 5; i++) {
       t.feed(results(i, 0, 0, 2000));
       t.feed(segment({ seq: i, seg: 0, count: 1, total: 3, offset: 0, data: [i, 2, 3], setting: 0 }));
     }
-    const h = e.history('sonar');
+    const h = e.history('sonar').map((c): ColumnMessage => JSON.parse(c.json));
     expect(h.map((c) => c.n)).toEqual([3, 4, 5]);
     expect(h[2]).toMatchObject({ ch: 'sonar', startCm: 0, endCm: 2000, bottomCm: 1000 });
     expect(Buffer.from(h[2].data, 'base64')).toEqual(Buffer.from([4, 2, 3]));
@@ -220,12 +221,12 @@ describe('Engine', () => {
   });
 
   test('clears depth when data stops', () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'Date', 'performance'] });
+    vi.useFakeTimers(FAKE_CLOCK);
     const t = new FakeTransport();
     const deltas: Delta[] = [];
     const e = new Engine(t, { onDelta: (d) => deltas.push(d) });
     e.start();
-    t.feed(msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(1000, 17)));
+    t.feed(bottomMsg(1000));
     vi.advanceTimersByTime(7000);
     const last = deltas.at(-1)!.updates[0].values;
     expect(last).toContainEqual({ path: 'environment.depth.belowTransducer', value: null });
@@ -251,7 +252,7 @@ describe('Engine', () => {
     expect(e.state().channels.downvision).toMatchObject({ gainAuto: false, gain: 90 });
     expect(e.setChannel('sonar', { rangeAuto: false, rangeShallowCm: 0, rangeDeepCm: 3000 })).toBeNull();
     vi.advanceTimersByTime(1000);
-    expect(e.history('sonar').at(-1)!.endCm).toBe(3000);
+    expect(JSON.parse(e.history('sonar').at(-1)!.json).endCm).toBe(3000);
     expect(e.setSystem({ transducerOffsetCm: 50 })).toBeNull();
     vi.advanceTimersByTime(1000);
     expect(e.state().system?.transducerOffsetCm).toBe(50);
@@ -270,9 +271,6 @@ describe('Engine', () => {
   });
 });
 
-const FAKE_CLOCK = { toFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'Date', 'performance'] } as const;
-const bottomMsg = (cm: number) => msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(cm, 17));
-const envMsg = (centiC: number) => msg(MsgId.ENV, 68, (b) => b.writeInt16LE(centiC, 28));
 /** An error-status message: sonar data that carries no reading (keeps the watchdog fed). */
 const errMsg = () => msg(MsgId.ERROR, 20);
 const valuesOf = (deltas: Delta[]) => deltas.flatMap((d) => d.updates[0].values);
@@ -358,7 +356,7 @@ describe('Engine lifecycle and output timing', () => {
     e.stop();
   });
 
-  test('depth is rate limited to 5 Hz and temperature to 1 Hz', () => {
+  test('depth is rate limited to 5 Hz and temperature to 1 Hz; the newest held-back value goes out when the limit allows', () => {
     vi.useFakeTimers(FAKE_CLOCK);
     const t = new FakeTransport();
     const deltas: Delta[] = [];
@@ -369,11 +367,12 @@ describe('Engine lifecycle and output timing', () => {
       t.feed(envMsg(1500 + i));
       if (i < 19) vi.advanceTimersByTime(50);
     }
-    // t = 950 ms: depth went out at 0, 200, 400, 600 and 800 ms, temperature once.
-    expect(pathValues(deltas, PATH.depth)).toEqual([10, 10.04, 10.08, 10.12, 10.16]);
+    // t = 950 ms: depth went out at 0, 200, 400, 600 and 800 ms (each time the newest value
+    // held back, just before the sample of that instant), temperature once.
+    expect(pathValues(deltas, PATH.depth)).toEqual([10, 10.03, 10.07, 10.11, 10.15]);
     expect(pathValues(deltas, PATH.waterTemp)).toEqual([288.15]);
-    vi.advanceTimersByTime(50); // t = 1 s: the tick flushes the latest values the limits held back
-    expect(pathValues(deltas, PATH.depth)).toEqual([10, 10.04, 10.08, 10.12, 10.16, 10.19]);
+    vi.advanceTimersByTime(50); // t = 1 s: both limits allow the latest values
+    expect(pathValues(deltas, PATH.depth)).toEqual([10, 10.03, 10.07, 10.11, 10.15, 10.19]);
     expect(pathValues(deltas, PATH.waterTemp)).toEqual([288.15, 288.34]);
     e.stop();
   });
@@ -401,7 +400,7 @@ describe('Engine lifecycle and output timing', () => {
     e.stop();
   });
 
-  test('a change the rate limit suppressed is flushed by the next tick, not lost until the next sample', () => {
+  test('a change the rate limit suppressed goes out as soon as the limit allows, not with the next sample', () => {
     vi.useFakeTimers(FAKE_CLOCK);
     const t = new FakeTransport();
     const deltas: Delta[] = [];
@@ -411,8 +410,94 @@ describe('Engine lifecycle and output timing', () => {
     vi.advanceTimersByTime(100);
     t.feed(bottomMsg(1010)); // inside the 200 ms window: suppressed
     expect(pathValues(deltas, PATH.depth)).toEqual([10]);
-    vi.advanceTimersByTime(900); // the 1 s tick re-feeds what the session holds
+    vi.advanceTimersByTime(99);
+    expect(pathValues(deltas, PATH.depth)).toEqual([10]);
+    vi.advanceTimersByTime(1); // t = 200 ms
     expect(pathValues(deltas, PATH.depth)).toEqual([10, 10.1]);
+    // A temperature waiting for its 1 s limit does not hold a later depth change back.
+    t.feed(envMsg(1500));
+    t.feed(envMsg(1600)); // held until t = 1.2 s
+    vi.advanceTimersByTime(100);
+    t.feed(bottomMsg(1020)); // held until t = 500 ms
+    vi.advanceTimersByTime(200);
+    expect(pathValues(deltas, PATH.depth)).toEqual([10, 10.1, 10.2]);
+    expect(pathValues(deltas, PATH.waterTemp)).toEqual([288.15]);
+    vi.advanceTimersByTime(700); // t = 1.2 s
+    expect(pathValues(deltas, PATH.waterTemp)).toEqual([288.15, 289.15]);
+    e.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test('an unchanged state is not emitted again', () => {
+    vi.useFakeTimers(FAKE_CLOCK);
+    const t = new FakeTransport();
+    const e = new Engine(t);
+    const states: unknown[] = [];
+    e.on('state', (s) => states.push(s));
+    e.start();
+    t.feed(envMsg(1500));
+    vi.advanceTimersByTime(300);
+    expect(states).toHaveLength(2); // 'connected', then the temperature
+    for (let i = 0; i < 5; i++) { t.feed(envMsg(1500)); t.feed(errMsg()); vi.advanceTimersByTime(1000); }
+    expect(states).toHaveLength(2); // the sonar's once-a-second status changed nothing
+    t.feed(envMsg(1510));
+    vi.advanceTimersByTime(300);
+    expect(states).toHaveLength(3);
+    e.stop();
+  });
+
+  test('history and the column event carry the same JSON, serialised once', () => {
+    const t = new FakeTransport();
+    const e = new Engine(t);
+    const seen: [ColumnMessage, string][] = [];
+    e.on('column', (c, json) => seen.push([c, json]));
+    e.start();
+    t.feed(channelSettings(0, 1));
+    t.feed(results(1, 0, 0, 2000));
+    t.feed(segment({ seq: 1, seg: 0, count: 1, total: 2, offset: 0, data: [7, 8], setting: 0 }));
+    expect(seen).toHaveLength(1);
+    const [c, json] = seen[0];
+    expect(JSON.parse(json)).toEqual(c);
+    expect(e.history('sonar')).toEqual([{ t: c.t, json }]);
+    e.stop();
+  });
+
+  test('after a lost link, settings from a sonar that restarted (lower seqs) are taken', () => {
+    const t = new FakeTransport();
+    const e = new Engine(t);
+    e.start();
+    t.feed(channelSettings(0, 9, { gain: 10 }));
+    t.feed(systemSettings(9, 0));
+    t.feed(channelSettings(0, 3, { gain: 20 })); // older seq within a session: ignored
+    expect(e.session.channelSettings(0)!.gain).toBe(10);
+    t.emit('link', 'lost', 'gone');
+    expect(e.session.channelSettings(0)!.gain).toBe(10); // kept until a replacement arrives
+    t.emit('link', 'connected', 'back');
+    t.feed(channelSettings(0, 2, { gain: 30 })); // the rebooted unit starts over
+    t.feed(systemSettings(2, 40));
+    expect(e.session.channelSettings(0)!.gain).toBe(30);
+    expect(e.state().system!.transducerOffsetCm).toBe(40);
+    t.feed(channelSettings(0, 1, { gain: 40 })); // after that, only newer seqs again
+    expect(e.session.channelSettings(0)!.gain).toBe(30);
+    e.stop();
+  });
+
+  test('re-acquiring the sonar does not send the cleared depth again before the first bottom record', () => {
+    const t = new FakeTransport();
+    const deltas: Delta[] = [];
+    const e = new Engine(t, { onDelta: (d) => deltas.push(d) });
+    e.start();
+    t.feed(systemSettings(1, 50));
+    t.feed(bottomMsg(1050));
+    t.emit('link', 'searching', 'Sonar offline');
+    expect(pathValues(deltas, PATH.depth)).toEqual([10, null]);
+    t.emit('link', 'connecting', 'found');
+    t.feed(systemSettings(1, 50)); // the same offset: nothing new to publish
+    expect(pathValues(deltas, PATH.depth)).toEqual([10, null]);
+    t.feed(systemSettings(2, -30)); // another offset: the paths that stop applying are cleared
+    expect(valuesOf(deltas)).toContainEqual({ path: PATH.surfaceToTransducer, value: null });
+    t.feed(bottomMsg(1100));
+    expect(pathValues(deltas, PATH.depth).at(-1)).toBe(11.3);
     e.stop();
   });
 

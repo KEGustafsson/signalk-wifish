@@ -17,6 +17,11 @@ export function encodeRecord(channel: number, msg: Uint8Array, nowMs = Date.now(
   return r;
 }
 
+/** The complete record at offset `o` (the caller knows it is complete, e.g. from readRawLog). */
+export function recordAt(buf: Buffer, o: number): RawRecord {
+  return { ts: Number(buf.readBigUInt64LE(o)), channel: buf[o + 8], msg: buf.subarray(o + RECORD_HEADER, o + RECORD_HEADER + buf.readUInt32LE(o + 9)) };
+}
+
 /**
  * Iterate records in a capture. Stops at a truncated record and yields
  * `{ truncated: { offset, missing } }` as the last item instead of a short message.
@@ -34,7 +39,7 @@ export function* readRawLog(buf: Buffer): Generator<RawRecord | Truncated> {
       yield { truncated: { offset: o, missing: end - buf.length } };
       return;
     }
-    yield { ts: Number(buf.readBigUInt64LE(o)), channel: buf[o + 8], msg: buf.subarray(o + RECORD_HEADER, end) };
+    yield recordAt(buf, o);
     o = end;
   }
 }

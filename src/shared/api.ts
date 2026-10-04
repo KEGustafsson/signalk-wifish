@@ -67,6 +67,8 @@ export interface WifishState {
   channels: Record<ChannelName, ChannelSettingsView | null>;
   /** Channels that have produced data. */
   active: Record<ChannelName, boolean>;
+  /** Columns the server keeps per channel (plugin option `historyColumns`). */
+  historyColumns: number;
 }
 
 /**
