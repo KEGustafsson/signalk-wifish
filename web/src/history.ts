@@ -1,6 +1,6 @@
 // Echogram columns held by the browser, per channel.
 
-import { MAX_HISTORY_COLUMNS, type ChannelName, type ColumnMessage } from '../../src/shared/api';
+import { DEFAULT_HISTORY_COLUMNS, MAX_HISTORY_COLUMNS, type ChannelName, type ColumnMessage } from '../../src/shared/api';
 
 export interface Col {
   n: number;
@@ -11,6 +11,14 @@ export interface Col {
   tempCentiC: number | null;
   samples: Uint8Array;
 }
+
+/**
+ * Columns a browser store keeps for a server that keeps `server` per channel (WifishState.historyColumns):
+ * the same, but at least DEFAULT_HISTORY_COLUMNS so a screen fills even when the server keeps none,
+ * and at most MAX_HISTORY_COLUMNS.
+ */
+export const keptColumns = (server: number): number =>
+  Math.max(DEFAULT_HISTORY_COLUMNS, Math.min(MAX_HISTORY_COLUMNS, Math.round(server)));
 
 /** Base64 to bytes; null when the text is not base64. */
 function decode(b64: string): Uint8Array | null {
@@ -26,11 +34,47 @@ function decode(b64: string): Uint8Array | null {
 
 export class ColumnStore {
   readonly cols: Col[] = [];
+  /** Incremented by clear(): column numbers of different generations are unrelated. */
+  generation = 0;
+  #max: number;
+  /** Columns the server keeps per channel, once a state said so. */
+  #server: number | null = null;
+  /** The most columns its trace has shown at once. */
+  #screen = 0;
   /**
-   * Columns kept per channel: the server's largest history (plugin option `historyColumns`,
-   * at most MAX_HISTORY_COLUMNS), so a long server history is not cut short in the browser.
+   * Keeps up to `max` columns; until the server says how many it keeps (fitServer()) that is its
+   * largest history, so a backlog is never cut short.
    */
-  constructor(readonly channel: ChannelName, readonly max = MAX_HISTORY_COLUMNS) {}
+  constructor(readonly channel: ChannelName, max = MAX_HISTORY_COLUMNS) { this.#max = max; }
+
+  /** Keep what a server keeping `server` columns does (keptColumns), and never less than a screenful (reserve()). */
+  fitServer(server: number): void {
+    this.#server = server;
+    this.#fit();
+  }
+
+  /** Its trace shows `n` columns at once (a wide screen at the slowest speed can show more than the server keeps). */
+  reserve(n: number): void {
+    if (n <= this.#screen) return;
+    this.#screen = n;
+    this.#fit();
+  }
+
+  /** Resize to the server's history or the widest screenful, whichever is larger, once the server's is known. */
+  #fit(): void {
+    if (this.#server === null) return;
+    const max = Math.max(keptColumns(this.#server), Math.min(MAX_HISTORY_COLUMNS, this.#screen));
+    if (max !== this.#max) this.resize(max);
+  }
+
+  /** Columns kept at most. */
+  get max(): number { return this.#max; }
+
+  /** Keep at most `max` columns from now on, dropping the oldest ones beyond it. */
+  resize(max: number): void {
+    this.#max = max;
+    if (this.cols.length > max) this.cols.splice(0, this.cols.length - max);
+  }
 
   /** Number of the oldest held column, or 0 when empty. */
   get first(): number { return this.cols.length ? this.cols[0].n : 0; }
@@ -54,7 +98,7 @@ export class ColumnStore {
       n: m.n, t: m.t, startCm: m.startCm, endCm: m.endCm, bottomCm: m.bottomCm, tempCentiC: m.waterTempCentiC,
       samples,
     });
-    if (this.cols.length > this.max) this.cols.splice(0, this.cols.length - this.max);
+    if (this.cols.length > this.#max) this.cols.splice(0, this.cols.length - this.#max);
     return true;
   }
 
@@ -90,5 +134,8 @@ export class ColumnStore {
   }
 
   /** Drop all held columns. */
-  clear(): void { this.cols.length = 0; }
+  clear(): void {
+    this.cols.length = 0;
+    this.generation++;
+  }
 }

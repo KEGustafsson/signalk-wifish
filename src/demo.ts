@@ -129,12 +129,14 @@ export class DemoDevice extends EventEmitter<TransportEvents> implements Transpo
     if (id === MsgId.CHAN_SETTINGS) {
       const s = parseChannelSettings(b);
       if (s && this.#chan.has(s.index)) {
-        this.#chan.set(s.index, Uint8Array.from(b));
-        this.emit('datagram', Uint8Array.from(b));
+        // One copy, kept and echoed: the session copies what it keeps and never changes a datagram.
+        const copy = Uint8Array.from(b);
+        this.#chan.set(s.index, copy);
+        this.emit('datagram', copy);
       }
     } else if (id === MsgId.SYS_SETTINGS && parseSystemSettings(b)) {
       this.#sys = Uint8Array.from(b);
-      this.emit('datagram', Uint8Array.from(b));
+      this.emit('datagram', this.#sys);
     }
   }
 
@@ -165,8 +167,8 @@ export class DemoDevice extends EventEmitter<TransportEvents> implements Transpo
     putStr(st.b, 39, 'Demo sonar OK', 64);
     this.emit('datagram', st.b);
 
-    this.emit('datagram', Uint8Array.from(this.#sys));
-    for (const c of this.#chan.values()) this.emit('datagram', Uint8Array.from(c));
+    this.emit('datagram', this.#sys);
+    for (const c of this.#chan.values()) this.emit('datagram', c);
   }
 
   // ---------------------------------------------------------------- scene

@@ -2,10 +2,9 @@ import { test, expect } from 'vitest';
 import { centiCToK, cmToM, toDelta, depthValues, Throttle, PATH } from '../src/signalk';
 
 test('centiCToK has no float noise across -40..+60 degC', () => {
-  for (let c = -4000; c <= 6000; c++) {
-    const k = centiCToK(c);
-    expect(k).toBe(Number(k.toFixed(2)));
-  }
+  // One expect per value is slow over 10 001 values: find the first bad one instead.
+  const noisy = Array.from({ length: 10_001 }, (_, i) => i - 4000).find((c) => centiCToK(c) !== Number(centiCToK(c).toFixed(2)));
+  expect(noisy).toBeUndefined();
   expect(centiCToK(1234)).toBe(285.49);
 });
 

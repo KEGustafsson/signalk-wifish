@@ -1,12 +1,9 @@
 import { describe, test, expect, vi, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { plugin, READONLY_GETS, READWRITE_POSTS, type AccessLevel, type Router, type ServerApp } from '../src/plugin';
-import { encodeRecord } from '../src/rawlog';
-import { MsgId } from '../src/sonar4';
-import { msg } from './helpers';
+import { FakeRes, bottomMsg, captureFile, req as mkReq, until } from './helpers';
 
 // The real device transport binds the discovery port; here a constructor that fails on demand stands in.
 vi.mock('../src/device', () => ({
@@ -23,26 +20,6 @@ vi.mock('../src/device', () => ({
 }));
 
 type Handler = (req: Record<string, unknown>, res: FakeRes, next: (e?: unknown) => void) => void;
-/** A request (an emitter: the event stream listens for its 'close'); GET with no headers unless overridden. */
-const mkReq = (o: Record<string, unknown> = {}) => Object.assign(new EventEmitter(), { method: 'GET', headers: {}, ...o }) as unknown as Record<string, unknown>;
-
-class FakeRes extends EventEmitter {
-  statusCode = 0;
-  headersSent = false;
-  headers: Record<string, string> = {};
-  chunks: string[] = [];
-  body = '';
-  ended = false;
-  writableLength = 0;
-  destroyed = false;
-  setHeader(k: string, v: string) { this.headers[k.toLowerCase()] = v; }
-  flushHeaders() { this.headersSent = true; }
-  write(c: string) { this.headersSent = true; this.chunks.push(c); return true; }
-  end(c?: string) { if (c) this.body = c; this.ended = true; this.emit('close'); }
-  destroy() { this.destroyed = true; this.emit('close'); }
-  get events() { return this.chunks.map((c) => /^event: (\w+)/.exec(c)?.[1]).filter((e): e is string => !!e); }
-}
-
 /** A plugin with recording app callbacks. */
 function make(extra: Partial<ServerApp> = {}) {
   const statuses: string[] = [];
@@ -69,14 +46,6 @@ function make(extra: Partial<ServerApp> = {}) {
   return { p, statuses, errors, debugs, call, handler: () => handler! };
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-async function until(cond: () => boolean, ms = 3000): Promise<void> {
-  const t0 = Date.now();
-  while (!cond()) {
-    if (Date.now() - t0 > ms) throw new Error('timed out waiting');
-    await sleep(10);
-  }
-}
 
 let cleanup: (() => void)[] = [];
 afterEach(() => {
@@ -139,7 +108,7 @@ describe('registerWithRouter', () => {
     const { call } = make();
     const miss = await call({ path: '/api/nothing' });
     expect(miss.next).toEqual([]);
-    expect(miss.res.ended).toBe(false);
+    expect(miss.res.writableEnded).toBe(false);
     const hit = await call({ path: '/api/state' });
     expect(hit.next).toBeNull();
     expect(hit.res.statusCode).toBe(503);
@@ -167,7 +136,7 @@ describe('registerWithRouter', () => {
       handler()(mkReq({ method: 'POST', path: '/api/system', headers: undefined }), res, () => resolve(res));
     });
     expect(sent.statusCode).toBe(200);
-    expect(sent.ended).toBe(true);
+    expect(sent.writableEnded).toBe(true);
   });
 });
 
@@ -210,10 +179,9 @@ describe('start / stop', () => {
   });
 
   test('link status maps to plugin status, offline to a plugin error except after stop', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wifish-'));
+    const file = captureFile([bottomMsg(900)]);
+    const dir = path.dirname(file);
     cleanup.push(() => fs.rmSync(dir, { recursive: true, force: true }));
-    const file = path.join(dir, 'c.bin');
-    fs.writeFileSync(file, encodeRecord(1, msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(900, 17)), 1));
     const { p, statuses } = make();
     cleanup.push(() => p.stop());
     p.start({ source: 'replay', replayFile: file });

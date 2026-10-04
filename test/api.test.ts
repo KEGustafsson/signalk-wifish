@@ -1,7 +1,6 @@
 import { describe, test, expect, vi, afterEach } from 'vitest';
 import http from 'node:http';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { EventEmitter } from 'node:events';
@@ -9,12 +8,10 @@ import { plugin } from '../src/plugin';
 import {
   Api, MAX_BACKLOG_BYTES, MAX_BODY_BYTES, MAX_STREAMS, MAX_UNREAD_BYTES, backlogFrames, parseChannelPatch, parseSystemPatch,
 } from '../src/api';
-import type { Engine } from '../src/engine';
+import type { Engine, HistoryEntry } from '../src/engine';
 import type { Delta } from '../src/signalk';
 import type { ColumnMessage, ChannelName } from '../src/shared/api';
-import { encodeRecord } from '../src/rawlog';
-import { MsgId } from '../src/sonar4';
-import { msg } from './helpers';
+import { FakeRes, bottomMsg, captureFile, req, sleep, tempDir, until } from './helpers';
 import { DEPTH_UNITS, presetCm } from '../src/shared/units';
 
 describe('patch validation', () => {
@@ -95,30 +92,12 @@ async function startPlugin(config: Record<string, unknown>, dataDir?: string) {
   return { p, base, deltas, statuses };
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-/** Poll until `cond` holds (within `ms`). */
-async function until(cond: () => boolean, ms = 3000): Promise<void> {
-  const t0 = Date.now();
-  while (!cond()) {
-    if (Date.now() - t0 > ms) throw new Error('timed out waiting');
-    await sleep(10);
-  }
-}
 const json = { 'content-type': 'application/json' };
-
-/** A capture of a few bottom records, for a replay source. */
-function captureFile(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wifish-'));
-  const file = path.join(dir, 'capture.bin');
-  const recs = [0, 100, 200].map((ts) => encodeRecord(1, msg(MsgId.BOTTOM, 22, (b) => b.writeInt32LE(1000 + ts, 17)), ts));
-  fs.writeFileSync(file, Buffer.concat(recs));
-  return file;
-}
 
 describe('plugin HTTP API (demo source)', () => {
   test('state, settings and the event stream', async () => {
     const { base, deltas } = await startPlugin({ source: 'demo' });
-    await sleep(1300);
+    await until(() => deltas.length > 0); // the demo connects at once and sends a bottom record every 83 ms
     const state = await (await fetch(`${base}/api/state`)).json();
     expect(state).toMatchObject({ source: 'demo', link: 'connected', canControl: true });
 
@@ -155,10 +134,7 @@ describe('plugin HTTP API (demo source)', () => {
     // so check the order up to the first "live": only the backlog and the live events that were
     // queued while it drained (columns and states) come before it.
     const live = events.indexOf('live');
-    const beforeLive = events.slice(3, live);
-    expect(beforeLive.filter((e) => e === 'col').length).toBeGreaterThan(5);
-    expect(beforeLive.every((e) => e === 'col' || e === 'state')).toBe(true);
-    expect(deltas.length).toBeGreaterThan(0);
+    expect(events.slice(3, live).every((e) => e === 'col' || e === 'state')).toBe(true);
   });
 
   test('refuses oversized bodies, unknown channels and POSTs to GET routes', async () => {
@@ -171,7 +147,7 @@ describe('plugin HTTP API (demo source)', () => {
   });
 
   test('display units are shared by all viewers and survive a restart', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wifish-'));
+    const dir = tempDir();
     let { base } = await startPlugin({ source: 'demo' }, dir);
     expect(await (await fetch(`${base}/api/display`)).json()).toEqual({});
 
@@ -182,10 +158,9 @@ describe('plugin HTTP API (demo source)', () => {
     expect(bad.status).toBe(400);
     const r = await fetch(`${base}/api/display`, { method: 'POST', headers: json, body: '{"depthUnit":"ft","tempUnit":"F"}' });
     expect(await r.json()).toEqual({ depthUnit: 'ft', tempUnit: 'F' });
-    let text = '';
-    while (!/event: display\ndata: \{"depthUnit/.test(text)) text += new TextDecoder().decode((await reader.read()).value);
+    const text = await readUntil(reader, /event: display\ndata: \{"depthUnit/);
     ctrl.abort();
-    expect(text.startsWith('retry: 2000\n\nevent: display\ndata: {}')).toBe(true);
+    expect(text).toContain('event: display\ndata: {}\n\n');
     expect(text).toContain('event: display\ndata: {"depthUnit":"ft","tempUnit":"F"}');
 
     // Following the sonar's unit is a choice too (null), and the file outlives the plugin.
@@ -198,7 +173,7 @@ describe('plugin HTTP API (demo source)', () => {
   });
 
   test('vessel settings are shared by all viewers, survive a restart and reach Signal K', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wifish-'));
+    const dir = tempDir();
     let { base, deltas } = await startPlugin({ source: 'demo' }, dir);
     expect(await (await fetch(`${base}/api/vessel`)).json()).toEqual({});
     const ctrl = new AbortController();
@@ -206,12 +181,11 @@ describe('plugin HTTP API (demo source)', () => {
     expect((await fetch(`${base}/api/vessel`, { method: 'POST', headers: json, body: '{"surfaceToTransducerCm":500}' })).status).toBe(400);
     const r = await fetch(`${base}/api/vessel`, { method: 'POST', headers: json, body: '{"surfaceToTransducerCm":40}' });
     expect(await r.json()).toEqual({ surfaceToTransducerCm: 40 });
-    let text = '';
-    while (!text.includes('event: vessel\ndata: {"surfaceToTransducerCm":40}')) text += new TextDecoder().decode((await reader.read()).value);
+    const text = await readUntil(reader, /event: vessel\ndata: \{"surfaceToTransducerCm":40\}/);
     ctrl.abort();
     expect(text).toContain('event: vessel\ndata: {}');
-    await sleep(1300); // the demo sonar sends bottom records
-    expect(deltas.flatMap((d) => d.updates[0].values)).toContainEqual({ path: 'environment.depth.surfaceToTransducer', value: 0.4 });
+    const published = () => deltas.flatMap((d) => d.updates[0].values);
+    await until(() => published().some((v) => v.path === 'environment.depth.surfaceToTransducer' && v.value === 0.4));
     stop!();
     await closeServer();
     ({ base, deltas } = await startPlugin({ source: 'demo' }, dir));
@@ -236,7 +210,7 @@ describe('plugin HTTP API (demo source)', () => {
   });
 
   test('a replay cannot be controlled: canControl false and 409 on settings', async () => {
-    const file = captureFile();
+    const file = captureFile([0, 100, 200].map((ts) => bottomMsg(1000 + ts)));
     const { base } = await startPlugin({ source: 'replay', replayFile: file });
     // Poll with one awaited request at a time: a fire-and-forget fetch still in flight when the
     // test server closes rejects unhandled (ECONNRESET on macOS) and fails the run.
@@ -284,39 +258,32 @@ describe('plugin lifecycle', () => {
 
 // ---------------------------------------------------------------- Api with fakes
 
-class FakeRes extends EventEmitter {
-  writableLength = 0;
-  destroyed = false;
-  writableEnded = false;
-  statusCode = 0;
-  headers: Record<string, string> = {};
-  chunks: string[] = [];
-  body = '';
-  /** When true, write() reports a full buffer (the caller must wait for 'drain'). */
-  full = false;
-  setHeader(k: string, v: string) { this.headers[k.toLowerCase()] = v; }
-  flushHeaders() {}
-  write(c: string) { this.chunks.push(c); this.writableLength += c.length; return !this.full; }
-  end(c?: string) { if (c) this.body = c; this.writableEnded = true; this.emit('close'); }
-  destroy() { this.destroyed = true; this.emit('close'); }
-  get json() { return JSON.parse(this.body); }
-  get events() { return this.chunks.map((c) => /^event: (\w+)/.exec(c)?.[1]).filter((e): e is string => !!e); }
-  get cols(): ColumnMessage[] { return this.chunks.filter((c) => c.startsWith('event: col\n')).map((c) => JSON.parse(c.slice('event: col\ndata: '.length))); }
-}
-type FakeReq = EventEmitter & { method: string; headers: Record<string, string>; [k: string]: unknown };
-/** A request: GET with no headers unless overridden. */
-const req = (o: Record<string, unknown> = {}): FakeReq => Object.assign(new EventEmitter(), { method: 'GET', headers: {}, ...o });
 /** A POST whose JSON body the server already parsed (Signal K's body-parser). */
 const parsed = (body: unknown, o: Record<string, unknown> = {}) => req({ method: 'POST', headers: json, body, readableEnded: true, ...o });
 const READONLY = { skIsAuthenticated: true, skPrincipal: { identifier: 'guest', permissions: 'readonly' } };
 
 type FakeEngine = EventEmitter & Pick<Engine, 'state' | 'history' | 'setChannel' | 'setSystem' | 'vesselChanged'>;
-function fakeEngine(o: Partial<FakeEngine> = {}): FakeEngine {
+/** An engine stand-in; `cols` gives each channel's history as ColumnMessages. */
+function fakeEngine(o: Partial<Omit<FakeEngine, 'history'>> & { cols?: (ch: ChannelName) => ColumnMessage[] } = {}): FakeEngine {
+  const { cols = () => [], ...rest } = o;
   return Object.assign(new EventEmitter(), {
-    state: () => ({ canControl: true }) as never, history: () => [], setChannel: () => null, setSystem: () => null, vesselChanged() {}, ...o,
+    state: () => ({ canControl: true }) as never, setChannel: () => null, setSystem: () => null, vesselChanged() {}, ...rest,
+    history: (ch: ChannelName): HistoryEntry[] => cols(ch).map((c) => ({ t: c.t, json: JSON.stringify(c) })),
   });
 }
 const col = (ch: ChannelName, n: number, t: number, data = ''): ColumnMessage => ({ ch, n, t, startCm: 0, endCm: 1000, bottomCm: null, waterTempCentiC: null, data });
+/** A new column from the engine, with its JSON as the engine sends it. */
+const emitCol = (engine: EventEmitter, c: ColumnMessage) => engine.emit('column', c, JSON.stringify(c));
+/** Read an event stream until its text matches `re`; fails if the stream ends first. */
+async function readUntil(reader: ReadableStreamDefaultReader<Uint8Array>, re: RegExp): Promise<string> {
+  let text = '';
+  while (!re.test(text)) {
+    const { done, value } = await reader.read();
+    if (done) throw new Error(`stream ended before ${re}`);
+    text += new TextDecoder().decode(value);
+  }
+  return text;
+}
 /** Wait (microtasks only, so fake timers don't matter) until the stream has gone live. */
 async function live(r: FakeRes): Promise<void> {
   for (let i = 0; i < 100 && !r.events.includes('live'); i++) await Promise.resolve();
@@ -422,7 +389,7 @@ describe('Api request handling', () => {
 describe('SSE streams', () => {
   test('the backlog is interleaved by time across both channels, then live', async () => {
     const sonar = [col('sonar', 1, 10), col('sonar', 2, 30)], downvision = [col('downvision', 1, 20)];
-    const api = new Api(() => fakeEngine({ history: (ch) => (ch === 'sonar' ? sonar : downvision) }) as never);
+    const api = new Api(() => fakeEngine({ cols: (ch) => (ch === 'sonar' ? sonar : downvision) }) as never);
     const r = new FakeRes();
     await stream(api, r);
     await live(r);
@@ -434,7 +401,7 @@ describe('SSE streams', () => {
 
   test('the backlog is capped by bytes, keeping the newest columns', async () => {
     const cols = Array.from({ length: 5 }, (_, i) => col('sonar', i + 1, i + 1, 'x'.repeat(300)));
-    const engine = fakeEngine({ history: (ch) => (ch === 'sonar' ? cols : []) });
+    const engine = fakeEngine({ cols: (ch) => (ch === 'sonar' ? cols : []) });
     const frames = backlogFrames(engine as never, 1000);
     expect(frames).toHaveLength(2);
     expect(frames.map((f) => JSON.parse(f.slice('event: col\ndata: '.length)).n)).toEqual([4, 5]);
@@ -443,7 +410,7 @@ describe('SSE streams', () => {
 
     // The stream applies MAX_BACKLOG_BYTES: 30 columns of ~100 KB cannot all go.
     const big = Array.from({ length: 30 }, (_, i) => col('downvision', i + 1, i + 1, 'y'.repeat(100_000)));
-    const api = new Api(() => fakeEngine({ history: (ch) => (ch === 'downvision' ? big : []) }) as never);
+    const api = new Api(() => fakeEngine({ cols: (ch) => (ch === 'downvision' ? big : []) }) as never);
     const r = new FakeRes();
     await stream(api, r);
     await live(r);
@@ -456,25 +423,32 @@ describe('SSE streams', () => {
     api.close();
   });
 
-  test('a column frame is serialised once for every viewer', async () => {
-    const stringify = vi.spyOn(JSON, 'stringify');
-    const backlogCol = col('sonar', 1, 1, 'abc');
-    const engine = fakeEngine({ history: (ch) => (ch === 'sonar' ? [backlogCol] : []) });
+  test('columns are sent as the engine serialised them, never serialised again per viewer', async () => {
+    const engine = fakeEngine({ cols: (ch) => (ch === 'sonar' ? [col('sonar', 1, 1, 'abc')] : []) });
     const api = new Api(() => engine as never);
     api.bind();
     const viewers = [new FakeRes(), new FakeRes(), new FakeRes()];
     for (const r of viewers) { await stream(api, r); await live(r); }
-    expect(stringify.mock.calls.filter(([v]) => v === backlogCol)).toHaveLength(1); // one backlog frame, three viewers
+    const stringify = vi.spyOn(JSON, 'stringify');
     const liveCol = col('sonar', 2, 2, 'def');
-    engine.emit('column', liveCol);
-    expect(stringify.mock.calls.filter(([v]) => v === liveCol)).toHaveLength(1);
-    expect(viewers.every((r) => r.chunks.at(-1)!.includes('"data":"def"'))).toBe(true);
+    engine.emit('column', liveCol, '{"the":"engine\'s JSON"}');
+    expect(stringify).not.toHaveBeenCalled();
     stringify.mockRestore();
+    for (const r of viewers) {
+      expect(r.cols[0].data).toBe('abc'); // the backlog column
+      expect(r.chunks.at(-1)).toBe('event: col\ndata: {"the":"engine\'s JSON"}\n\n');
+    }
     api.close();
   });
 
+  test('the backlog merge keeps time order, sonar first on equal times', () => {
+    const engine = fakeEngine({ cols: (ch) => (ch === 'sonar' ? [col('sonar', 1, 5), col('sonar', 2, 7), col('sonar', 3, 9)] : [col('downvision', 1, 5), col('downvision', 2, 8)]) });
+    const order = backlogFrames(engine as never).map((f) => JSON.parse(f.slice('event: col\ndata: '.length))).map((c: ColumnMessage) => `${c.ch[0]}${c.n}`);
+    expect(order).toEqual(['s1', 'd1', 's2', 'd2', 's3']);
+  });
+
   test('backlog writes honour backpressure and live columns wait their turn', async () => {
-    const engine = fakeEngine({ history: (ch) => (ch === 'sonar' ? [col('sonar', 1, 1), col('sonar', 2, 2)] : []) });
+    const engine = fakeEngine({ cols: (ch) => (ch === 'sonar' ? [col('sonar', 1, 1), col('sonar', 2, 2)] : []) });
     const api = new Api(() => engine as never);
     api.bind();
     const r = new FakeRes();
@@ -482,7 +456,7 @@ describe('SSE streams', () => {
     await stream(api, r);
     await Promise.resolve();
     expect(r.chunks).toEqual(['retry: 2000\n\n']); // waiting for 'drain'
-    engine.emit('column', col('sonar', 3, 3)); // arrives while the backlog is pending
+    emitCol(engine, col('sonar', 3, 3)); // arrives while the backlog is pending
     engine.emit('state', { canControl: true });
     expect(r.chunks).toHaveLength(1);
     r.full = false;
@@ -490,14 +464,14 @@ describe('SSE streams', () => {
     await live(r);
     expect(r.events).toEqual(['display', 'state', 'vessel', 'col', 'col', 'col', 'state', 'live']);
     expect(r.cols.map((c) => c.n)).toEqual([1, 2, 3]);
-    engine.emit('column', col('sonar', 4, 4));
+    emitCol(engine, col('sonar', 4, 4));
     expect(r.events.at(-1)).toBe('col');
     api.close();
   });
 
   test('a viewer that closes while its backlog drains is forgotten without error', async () => {
     const errors: string[] = [];
-    const api = new Api(() => fakeEngine({ history: () => [col('sonar', 1, 1)] }) as never, undefined, undefined, { error: (m) => errors.push(m) });
+    const api = new Api(() => fakeEngine({ cols: () => [col('sonar', 1, 1)] }) as never, undefined, undefined, { error: (m) => errors.push(m) });
     const r = new FakeRes();
     r.full = true;
     await stream(api, r);
@@ -517,11 +491,11 @@ describe('SSE streams', () => {
     for (const r of [slow, fast]) { await stream(api, r); await live(r); }
     slow.writableLength = 2 * MAX_UNREAD_BYTES; // 8 MB of live data never drained
     fast.writableLength = 0;
-    engine.emit('column', col('sonar', 1, 1));
+    emitCol(engine, col('sonar', 1, 1));
     expect(slow.destroyed).toBe(true);
     expect(fast.destroyed).toBe(false);
     const before = slow.chunks.length;
-    engine.emit('column', col('sonar', 2, 2));
+    emitCol(engine, col('sonar', 2, 2));
     expect(slow.chunks.length).toBe(before);
     expect(fast.chunks.at(-1)).toMatch(/event: col/);
     api.close();

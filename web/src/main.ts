@@ -2,8 +2,9 @@
 
 import { ColumnStore } from './history';
 import { TraceView } from './trace';
+import { clampSpeed } from './geometry';
 import { PluginStream, setChannel, setDisplay, setSystem, setVessel } from './stream';
-import { prefs, savePrefs, storedKeys, MAX_SPEED, MIN_SPEED, type Prefs, type ViewConfig } from './prefs';
+import { prefs, savePrefs, storedKeys, type Prefs, type ViewConfig } from './prefs';
 import { ICONS } from './icons';
 import {
   aboutDialog, closeAll, helpDialog, mainSettings, messageBox, overflowMenu, sonarSettings, viewSwitcher,
@@ -27,15 +28,13 @@ let state: WifishState | null = null;
 /** Vessel settings kept by the plugin (waterline-to-transducer distance). */
 let vessel: VesselSettings = {};
 const listeners = new Set<(s: WifishState | null) => void>();
-const stores: Record<ChannelName, ColumnStore> = {
-  sonar: new ColumnStore('sonar'),
-  downvision: new ColumnStore('downvision'),
-};
 const traces: Record<ChannelName, TraceView> = {
-  sonar: new TraceView('sonar', stores.sonar, 'Sonar'),
-  downvision: new TraceView('downvision', stores.downvision, 'DownVision'),
+  sonar: new TraceView('sonar', new ColumnStore('sonar'), 'Sonar'),
+  downvision: new TraceView('downvision', new ColumnStore('downvision'), 'DownVision'),
 };
 const ORDER: ChannelName[] = ['sonar', 'downvision'];
+/** Both traces, in ORDER. */
+const TRACES: readonly TraceView[] = ORDER.map((ch) => traces[ch]);
 /** View forced while a settings popover is open (the app shows only that channel). */
 let tempView: ViewConfig | null = null;
 let backlogDone = false;
@@ -82,7 +81,7 @@ function applyView(): void {
   tracesEl.className = `traces ${v}`;
   traces.sonar.el.hidden = v === 'downvision';
   traces.downvision.el.hidden = v === 'sonar';
-  for (const t of Object.values(traces)) t.invalidate();
+  for (const t of TRACES) t.invalidate();
 }
 
 /**
@@ -131,10 +130,10 @@ btnViews.innerHTML = ICONS.viewSwitcher;
 btnSnapshot.innerHTML = ICONS.camera;
 btnMore.innerHTML = ICONS.more;
 btnFF.innerHTML = ICONS.fastForward;
-for (const t of Object.values(traces)) t.gear.innerHTML = ICONS.gear;
+for (const t of TRACES) t.gear.innerHTML = ICONS.gear;
 
 /** True when any trace is held on history instead of following new pings. */
-const paused = () => Object.values(traces).some((t) => !t.live);
+const paused = () => TRACES.some((t) => !t.live);
 
 let pausePainted: boolean | null = null;
 /** Update the pause/play button; the fast-forward button and history scrollbar show only while paused. */
@@ -153,7 +152,7 @@ function paintPause(): void {
 
 /** Pause or resume all traces together and update the toolbar. */
 function setPaused(p: boolean): void {
-  for (const t of Object.values(traces)) t.pause(p);
+  for (const t of TRACES) t.pause(p);
   paintPause();
 }
 
@@ -188,7 +187,7 @@ btnMore.addEventListener('click', () => {
 let gearTimer: number | undefined;
 /** Hide every trace's settings gear and cancel the auto-hide timer. */
 function hideGears(): void {
-  for (const t of Object.values(traces)) t.gear.classList.remove('shown');
+  for (const t of TRACES) t.gear.classList.remove('shown');
   window.clearTimeout(gearTimer);
 }
 /** Toggle a trace's settings gear on tap; it hides again after 5 s (never shown on a Wi-Fish). */
@@ -206,7 +205,7 @@ for (const ch of ORDER) traces[ch].gear.addEventListener('click', (e) => { e.sto
 // ------------------------------------------------------------------ history scrolling (both traces together)
 
 /** Traces not hidden by the current view. */
-const shownTraces = () => Object.values(traces).filter((t) => !t.el.hidden);
+const shownTraces = () => TRACES.filter((t) => !t.el.hidden);
 
 /** Trace that leads history scrolling and the scrollbar: the first shown one with data. */
 function lead(): TraceView {
@@ -220,7 +219,7 @@ function lead(): TraceView {
  * When the lead is live, all resume live together.
  */
 function followLead(l: TraceView): void {
-  for (const t of Object.values(traces)) {
+  for (const t of TRACES) {
     if (t === l) continue;
     if (l.live) { t.scrollTo(null); continue; }
     const c = l.store.get(l.right);
@@ -270,7 +269,7 @@ function zoomAll(factor: number, clientX: number, clientY: number, atPointer = f
 
 /** Visible trace under the given client point, if any. */
 function traceAt(x: number, y: number): TraceView | null {
-  for (const t of Object.values(traces)) {
+  for (const t of TRACES) {
     if (t.el.hidden) continue;
     const r = t.el.getBoundingClientRect();
     if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return t;
@@ -280,8 +279,8 @@ function traceAt(x: number, y: number): TraceView | null {
 
 /** Set the scrolling speed on every trace (1..5, saved by the caller). */
 function useSpeed(s: number): void {
-  prefs.speed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, s));
-  for (const t of Object.values(traces)) t.setSpeed(prefs.speed);
+  prefs.speed = clampSpeed(s);
+  for (const t of TRACES) t.setSpeed(prefs.speed);
 }
 
 tracesEl.addEventListener('pointerdown', (e) => {
@@ -360,13 +359,14 @@ function pointerEnd(e: PointerEvent): void {
     if (now - lastTap < 320 && t) {
       for (const tr of shownTraces()) tr.resetZoom(); // double tap: back to full range
       hideGears();
-    } else if (t) {
-      showGear(t.channel);
+      lastTap = 0; // a third quick tap starts a new pair
+    } else {
+      if (t) showGear(t.channel);
+      lastTap = now;
     }
-    lastTap = now;
   }
   if (pointers.size === 0) {
-    for (const t of Object.values(traces)) t.endGesture();
+    for (const t of TRACES) t.endGesture();
     if (gesture === 'pinch') savePrefs({ speed: prefs.speed });
     gesture = 'none';
     pinch0 = null;
@@ -442,6 +442,12 @@ function showDetails(x: number, y: number): void {
 const scrollEl = $<HTMLDivElement>('history-scroll');
 const thumb = scrollEl.querySelector<HTMLDivElement>('.thumb') ?? (() => { throw new Error('wifish: index.html has no .thumb in #history-scroll'); })();
 let scrollPainted = '';
+/** Scrollbar width, CSS px, as the ResizeObserver last reported it (no layout read per frame). */
+let scrollW = 0;
+new ResizeObserver(() => {
+  scrollW = scrollEl.clientWidth;
+  paintScrollbar(); // before the first paint after it is shown
+}).observe(scrollEl);
 /**
  * Size and place the scrollbar thumb for the visible part of the lead trace's history and expose
  * its position (0 = oldest, 100 = live) to assistive technology.
@@ -452,7 +458,7 @@ function paintScrollbar(): void {
   const first = t.store.first, last = t.store.last;
   const total = Math.max(1, last - first + 1);
   const vis = Math.min(total, t.visibleColumns());
-  const w = scrollEl.clientWidth;
+  const w = scrollW;
   const tw = Math.max(24, (vis / total) * w);
   // Thumb at the left: the oldest column fills the screen (right = first + vis - 1); at the right: live.
   const frac = total > vis ? (t.right - (first + vis - 1)) / (total - vis) : 1;
@@ -545,11 +551,18 @@ btnSnapshot.addEventListener('click', () => {
   g.textBaseline = 'top';
   const lines = [...db.querySelectorAll('.env')].map((e) => e.textContent?.replace(/(\d)([a-z°])/i, '$1 $2') ?? '');
   lines.forEach((l, i) => g.fillText(l, dr.left - rect.left + 12, dr.top - rect.top + 10 + i * 34));
-  const a = document.createElement('a');
   const ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
-  a.download = `wifish-${ts}.png`;
-  a.href = c.toDataURL('image/png');
-  a.click();
+  // Encoded off the main thread; an object URL avoids the base64 copy of a data URL.
+  c.toBlob((blob) => {
+    if (!blob) { toast('Snapshot failed'); return; }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.download = `wifish-${ts}.png`;
+    a.href = url;
+    a.click();
+    // Some browsers fetch the URL after click() returns: revoke it a little later.
+    window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  }, 'image/png');
   const flash = $('flash');
   flash.hidden = false;
   flash.classList.remove('go');
@@ -597,7 +610,7 @@ let streamOk = true;
 /** Update the connecting/offline screens, source label, and the lost-connection and low-voltage dialogs. */
 function paintConnection(): void {
   const s = state;
-  const anyData = stores.sonar.cols.length + stores.downvision.cols.length > 0;
+  const anyData = TRACES.some((t) => t.store.cols.length > 0);
   // Like the app returning to its connecting screen: shown whenever no sonar session runs,
   // even if old pictures are still in memory.
   const showConnecting = !s || !streamOk || s.link === 'searching' || s.link === 'offline' || (!anyData && s.link !== 'connected');
@@ -661,6 +674,8 @@ function onState(s: WifishState | null): void {
     if (epoch !== null) resetHistory();
     epoch = s.epoch;
   }
+  // Keep as many columns as the server does (it sends no more), at least a screenful.
+  if (s && Number.isFinite(s.historyColumns)) for (const t of TRACES) t.store.fitServer(s.historyColumns);
   const prevWifish = isWifish();
   const prevSys = state?.system ?? null;
   state = s;
@@ -670,7 +685,7 @@ function onState(s: WifishState | null): void {
   btnViews.hidden = wifish;
   if (prevWifish !== wifish) {
     hideGears();
-    for (const t of Object.values(traces)) t.gear.hidden = wifish; // its settings live in the toolbar
+    for (const t of TRACES) t.gear.hidden = wifish; // its settings live in the toolbar
   }
   applyView();
   // The traces only care about the system settings (offset, the sonar's unit); the databox about every state.
@@ -746,8 +761,7 @@ function onVessel(v: VesselSettings): void {
 
 /** Clear the stores and return the traces to live and unzoomed. */
 function resetHistory(): void {
-  for (const s of Object.values(stores)) s.clear();
-  for (const t of Object.values(traces)) { t.scrollTo(null); t.resetZoom(); }
+  for (const t of TRACES) { t.store.clear(); t.scrollTo(null); t.resetZoom(); }
   paintPause();
 }
 
@@ -774,11 +788,10 @@ const stream = new PluginStream({
   /** Store an incoming ping column and redraw its trace if it is live (a paused one shows nothing new). */
   column(c) {
     if (!isChannelName(c.ch)) return;
-    const store = stores[c.ch];
-    if (!store.add(c)) return;
     const t = traces[c.ch];
+    if (!t.store.add(c)) return;
     if (t.live) t.invalidate();
-    if (backlogDone && store.cols.length === 1) paintConnection();
+    if (backlogDone && t.store.cols.length === 1) paintConnection();
   },
   /** Plugin history restarted: the next state's epoch is taken as the new run's. */
   reset() {
@@ -802,13 +815,13 @@ const stream = new PluginStream({
 
 /** Animation frame: draw traces that changed and the scrollbar, then schedule the next frame. */
 function frame(now: number): void {
-  for (const t of Object.values(traces)) t.draw(now);
+  for (const t of TRACES) t.draw(now);
   paintScrollbar();
   requestAnimationFrame(frame);
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) for (const t of Object.values(traces)) t.invalidate();
+  if (!document.hidden) for (const t of TRACES) t.invalidate(true);
 });
 
 applyPrefs();

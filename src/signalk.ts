@@ -83,6 +83,15 @@ export class Throttle {
     if (due) this.#last.set(path, { value, t: now });
     return due;
   }
+  /**
+   * Milliseconds until `value`, a change for `path` that `shouldEmit` held back, may go out;
+   * null when it is not a change (nothing waits to be sent).
+   */
+  holdMs(path: string, value: unknown, now: number): number | null {
+    const l = this.#last.get(path);
+    if (!l || l.value === value) return null;
+    return Math.max(0, this.minIntervalMs - (now - l.t));
+  }
   /** Forget all last-sent values so the next value of every path is emitted. */
   reset(): void {
     this.#last.clear();

@@ -6,7 +6,6 @@
   "types": "dist/index.d.ts",
   "files": [
     "dist",
-    "!dist/**/*.map",
     "!dist/devserver.*",
     "public",
     "!public/*.map",
@@ -22,10 +21,11 @@
     "build:server": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "build:web": "node web/build.mjs",
     "watch:web": "node web/build.mjs --watch",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "dev": "npm run build && node dist/devserver.js --demo",
+    "pretest": "npm run typecheck",
     "test": "vitest run",
-    "prepare": "npm run build",
+    "prepack": "npm run build",
     "preprobe": "npm run build:server",
     "probe": "node tools/wifish-probe.mjs",
     "predump": "npm run build:server",
@@ -53,7 +53,7 @@
   },
   "license": "MIT",
   "devDependencies": {
-    "@types/node": "^22.10.0",
+    "@types/node": "^20.19.43",
     "esbuild": "^0.28.2",
     "typescript": "~5.9.0",
     "vitest": "^4.1.11"

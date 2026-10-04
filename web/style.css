@@ -1,7 +1,7 @@
 /* Wi-Fish Sonar — dark marine UI after the Raymarine Wi-Fish app (colors.xml of v0.7.1). */
 :root {
   --bg: #242328;            /* main_background */
-  --bg-semi: #d0242328;     /* main_background_semitransparent */
+  --bg-semi: #242328d0;     /* main_background_semitransparent (CSS #RRGGBBAA; colors.xml has #AARRGGBB) */
   --border: #505050;        /* dialog_border */
   --accent: #2b78e4;        /* sonar_settings_tab_secondary / switch_color */
   --highlight: #1f85ff;
@@ -44,7 +44,6 @@ button { font: inherit; color: inherit; }
 .trace { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: hidden; cursor: grab; }
 .trace:active { cursor: grabbing; }
 .trace canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-.trace canvas.echo { image-rendering: auto; }
 @media (orientation: portrait) {
   .traces { flex-direction: column; }
   .traces .separator { width: auto; height: 1px; }
@@ -113,7 +112,7 @@ button { font: inherit; color: inherit; }
 .settings-popover { width: min(520px, calc(100vw - 16px)); }
 .tabs { display: flex; border-bottom: 1px solid var(--border); }
 .tab { flex: 1; background: none; border: 0; padding: 14px 6px 11px; cursor: pointer; font-weight: 600; color: #fff; border-bottom: 3px solid transparent; }
-.tab.selected { border-bottom-color: var(--accent); color: #fff; }
+.tab.selected { border-bottom-color: var(--accent); }
 .tab:not(.selected) { color: #c9c9cf; }
 .panels { padding: 10px 16px 14px; }
 .panel { display: grid; align-items: center; gap: 12px 14px; }
@@ -121,7 +120,6 @@ button { font: inherit; color: inherit; }
 .grid2 { grid-template-columns: 1fr auto; }
 .grid-range { grid-template-columns: 1fr minmax(110px, auto) 28px; }
 .col-label { text-align: center; font-size: 13px; color: var(--muted); }
-.label { color: #fff; }
 .label .value { display: inline-block; min-width: 2.2em; margin-left: 8px; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; }
 .unit { color: var(--muted); }
 .settings-note { padding: 0 16px 12px; color: var(--muted); font-size: 13px; }

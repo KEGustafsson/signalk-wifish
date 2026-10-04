@@ -36,7 +36,7 @@ export const TIMING = Object.freeze({
   GIVE_UP_MS: 20_000,
 });
 
-/** A local IPv4 address a socket can be bound or joined on; netmask null when configured by hand. */
+/** A local IPv4 address a socket can be bound or joined on; netmask null when unknown. */
 export interface Candidate { address: string; netmask: string | null }
 
 /** Monotonic clock, ms. */
@@ -54,13 +54,14 @@ const candidatesKey = (cs: Candidate[]) => cs.map((c) => c.address).sort().join(
 
 /**
  * Local interfaces to listen on, from `os.networkInterfaces()`: the configured `iface`
- * alone, else the non-internal IPv4 addresses (only the 192.x ones when there are any,
- * which is how the app picks its interface).
+ * alone (none while no interface has that address), else the non-internal IPv4 addresses
+ * (only the 192.x ones when there are any, which is how the app picks its interface).
  */
 export function candidatesFrom(ifaces: NodeJS.Dict<os.NetworkInterfaceInfo[]>, iface?: string): Candidate[] {
-  if (iface) return [{ address: iface, netmask: null }];
-  const all = Object.values(ifaces).flat()
-    .filter((a): a is os.NetworkInterfaceInfoIPv4 => !!a && a.family === 'IPv4' && !a.internal);
+  const v4 = Object.values(ifaces).flat()
+    .filter((a): a is os.NetworkInterfaceInfoIPv4 => !!a && a.family === 'IPv4');
+  if (iface) return v4.filter((a) => a.address === iface).slice(0, 1).map((a) => ({ address: a.address, netmask: a.netmask }));
+  const all = v4.filter((a) => !a.internal);
   const c192 = all.filter((a) => a.address.startsWith('192.'));
   return (c192.length ? c192 : all).map((a) => ({ address: a.address, netmask: a.netmask }));
 }
@@ -127,8 +128,6 @@ export class DeviceTransport extends EventEmitter<TransportEvents> implements Tr
   #lastRx = 0;
   /** Last message reported per problem kind, so a persistent one is reported once, not every second. */
   #reported = new Map<string, string>();
-  /** Service + candidates for which "no interface to reach it" was already reported. */
-  #unreachable = '';
   /** Other sonars whose announcements were already reported as ignored during this lock-on. */
   #ignoredDevices = new Set<string>();
 
@@ -205,11 +204,19 @@ export class DeviceTransport extends EventEmitter<TransportEvents> implements Tr
     this.#retry = setTimeout(() => this.#safely('retry', () => { this.#retry = null; if (this.#running) this.#open(); }), TIMING.RETRY_MS);
   }
 
-  /** Bind the discovery socket, join its group on each candidate interface, then start the interface rescan. */
-  #open(): void {
+  /**
+   * Bind the discovery socket, join its group on each candidate interface, report 'searching'
+   * with `searching` as the status, then start the interface rescan.
+   */
+  #open(searching = 'Looking for a Wi-Fish / Dragonfly'): void {
     const { group, port } = this.#discovery;
-    this.#candidates = candidatesFrom(os.networkInterfaces(), this.#opts.iface);
-    if (!this.#candidates.length) return this.#scheduleRetry('No IPv4 network interface; join the sonar Wi-Fi');
+    const { iface } = this.#opts;
+    this.#candidates = candidatesFrom(os.networkInterfaces(), iface);
+    if (!this.#candidates.length) {
+      return this.#scheduleRetry(iface
+        ? `Wi-Fi interface address ${iface} is not on this machine; join the sonar Wi-Fi or correct the setting`
+        : 'No IPv4 network interface; join the sonar Wi-Fi');
+    }
     const disc = dgram.createSocket({ type: 'udp4', reuseAddr: true });
     this.#disc = disc;
     disc.on('error', (e) => { if (this.#disc === disc) this.#scheduleRetry(`discovery socket: ${e.message}`); });
@@ -224,7 +231,7 @@ export class DeviceTransport extends EventEmitter<TransportEvents> implements Tr
       // join is refused (some BSD stacks), keep listening instead of giving up.
       if (!joined) this.#report('join', `could not join ${group} on any interface; listening anyway`);
       this.#log(`listening ${group}:${port} on ${this.#candidates.map((c) => c.address).join(', ')}`);
-      this.#setLink('searching', 'Looking for a Wi-Fish / Dragonfly');
+      this.#setLink('searching', searching);
       // The sonar Wi-Fi often comes up after the server: while no session runs,
       // re-read the interfaces and rejoin discovery when they change.
       this.#rescan = setInterval(() => this.#safely('rescan', () => this.#rescanInterfaces()), TIMING.RETRY_MS);
@@ -282,8 +289,8 @@ export class DeviceTransport extends EventEmitter<TransportEvents> implements Tr
       this.#unit = { b: Uint8Array.from(b), from: sender };
       if (this.#timer) this.#rx(b); // during a session: pass it on; before one, #maybeStart replays it
       else this.#maybeStart();
-    } else if (isSonarMessage(id) && this.#timer) {
-      this.#rx(b); // sonar data on the discovery group:port, only while a session runs
+    } else if (isSonarMessage(id) && this.#timer && sender === this.#service?.device) {
+      this.#rx(b); // sonar data on the discovery group:port, only from our sonar while a session runs
     }
   }
 
@@ -304,18 +311,8 @@ export class DeviceTransport extends EventEmitter<TransportEvents> implements Tr
   #maybeStart(): void {
     const s = this.#service;
     if (!s || !this.#unit || this.#unit.from !== s.device || this.#timer) return;
+    // Never empty: the discovery socket that got here is only opened with a candidate.
     const ifaces = ifacesFor(this.#candidates, s.device);
-    if (!ifaces.length) {
-      // Can't happen while the discovery socket is open (it needs a candidate too), but if it
-      // does, say why once instead of on every unit datagram, until something changes.
-      const key = `${s.device}|${candidatesKey(this.#candidates)}`;
-      if (this.#unreachable === key) return;
-      this.#unreachable = key;
-      const why = `Sonar ${s.device} found, but no local IPv4 interface to reach it; set the Wi-Fi interface address`;
-      this.#report('unreachable', why);
-      this.#setLink('offline', why);
-      return;
-    }
     const ctrlAddr = controlAddress(this.#candidates, s.device);
     this.#log(`sonar ${s.device}, data ${s.group}:${s.port}, control port ${s.ctrlPort}, via ${ifaces.join(', ')}${ctrlAddr ? '' : ' (control socket routed by the OS)'}`);
     this.#lastRx = mono();
@@ -339,7 +336,10 @@ export class DeviceTransport extends EventEmitter<TransportEvents> implements Tr
       const data = dgram.createSocket({ type: 'udp4', reuseAddr: true });
       this.#data = data;
       data.on('error', (e) => { if (this.#data === data) this.#scheduleRetry(`data socket: ${e.message}`); });
-      data.on('message', (b) => this.#safely('data message', () => { if (this.#data === data) this.#rx(b); }));
+      // Only our sonar's data: another unit (or this one on a new address) must not keep the session alive.
+      data.on('message', (b, rinfo) => this.#safely('data message', () => {
+        if (this.#data === data && rinfo.address === s.device) this.#rx(b);
+      }));
       data.bind(s.port, () => this.#safely('data bind', () => {
         if (this.#data !== data) return; // closed or replaced meanwhile
         join(data, () => {});
@@ -361,10 +361,10 @@ export class DeviceTransport extends EventEmitter<TransportEvents> implements Tr
     const quiet = mono() - this.#lastRx;
     if (quiet > TIMING.GIVE_UP_MS) {
       this.#log('no sonar data, rejoining discovery');
-      this.#setLink('searching', 'Sonar offline. Looking for a Wi-Fish / Dragonfly');
       // Reopen discovery too: a reconnected adapter may have dropped the socket's memberships.
+      // The status says the sonar went away, unlike a search that never found one.
       this.#close();
-      this.#open();
+      this.#open('Sonar offline. Looking for a Wi-Fish / Dragonfly');
       return;
     }
     if (quiet > TIMING.QUIET_MS && this.#link === 'connected') this.#setLink('lost', 'Trying to restore connection to the sounder');

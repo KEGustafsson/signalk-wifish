@@ -1,0 +1,13 @@
+{
+  "//": "Type-checks the tests (vitest strips types without checking them). Tests run as ES modules and import web/src too.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "rootDir": ".",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"]
+  },
+  "include": ["test"]
+}

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DisplayStore, VesselStore, parseDisplayPatch, parseVesselPatch } from '../src/store';
+import { escapeRe } from './helpers';
 
 describe('display units', () => {
   test('patch validation', () => {
@@ -64,7 +65,7 @@ describe('store logging', () => {
     expect(s.set({ tempUnit: 'F' })).toEqual({ tempUnit: 'F' });
     expect(s.get()).toEqual({ tempUnit: 'F' });
     expect(errors).toHaveLength(1);
-    expect(errors[0]).toMatch(new RegExp(`^cannot save ${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: `));
+    expect(errors[0]).toMatch(new RegExp(`^cannot save ${escapeRe(file)}: `));
     expect(debugs).toEqual([]);
     fs.rmSync(dir, { recursive: true, force: true });
   });

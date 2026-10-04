@@ -30,6 +30,46 @@ export interface TraceLook {
   speed: number;
 }
 
+/** Row-to-sample index map for one depth window, rebuilt only when the column geometry changes. */
+class RowMap {
+  #map = new Int32Array(0);
+  #len = -1;
+  #endCm = NaN;
+  #top = NaN;
+  #bottom = NaN;
+
+  /**
+   * Sample index drawn at each of `H` rows for a column of `len` samples over 0..`endCm` cm in
+   * window `win`; -1 where the row lies outside the samples.
+   */
+  get(len: number, endCm: number, win: Window, H: number): Int32Array {
+    if (len === this.#len && endCm === this.#endCm && win.top === this.#top && win.bottom === this.#bottom && H === this.#map.length) {
+      return this.#map;
+    }
+    if (this.#map.length !== H) this.#map = new Int32Array(H);
+    const map = this.#map, span = win.bottom - win.top, k = len / endCm;
+    for (let y = 0; y < H; y++) {
+      const i = Math.floor((win.top + ((y + 0.5) / H) * span) * k);
+      map[y] = i >= 0 && i < len ? i : -1;
+    }
+    this.#len = len;
+    this.#endCm = endCm;
+    this.#top = win.top;
+    this.#bottom = win.bottom;
+    return map;
+  }
+}
+
+/** What the echo canvas shows, so the next frame can scroll it instead of redrawing it. */
+interface Shown {
+  W: number; H: number; mainW: number; zbW: number; colW: number; right: number;
+  /** Main area window and full window (the zoom box's). */
+  top: number; bottom: number; fullTop: number; fullBottom: number;
+  palette: number;
+  /** ColumnStore.generation the columns came from. */
+  gen: number;
+}
+
 export class TraceView {
   readonly el: HTMLDivElement;
   readonly gear: HTMLButtonElement;
@@ -44,6 +84,10 @@ export class TraceView {
   #image: ImageData | null = null;
   #pix: Uint32Array | null = null;
   #dirty = true;
+  /** Overlay must be redrawn whatever its inputs say (its canvas was resized, i.e. cleared). */
+  #ovDirty = true;
+  /** Inputs the overlay was last drawn with (see #overlayKey). */
+  #ovKey: readonly unknown[] = [];
 
   palette = 4;
   unit: DepthUnit = unitById('m');
@@ -61,10 +105,14 @@ export class TraceView {
   #anim: { from: Window; to: Window; t0: number } | null = null;
   #lastTrackY = -1e9;
   /** Full range last drawn; a change resets the zoom like the app (SonarTraceView.h()). */
-  #lastFull = '';
-  /** What the echo canvas currently shows, for incremental scrolling. */
-  #shown: { W: number; H: number; mainW: number; zbW: number; colW: number; right: number; top: number; bottom: number; palette: number } | null = null;
+  #lastFull: Window | null = null;
+  /** What the echo canvas currently shows, for incremental scrolling; null = redraw it all. */
+  #shown: Shown | null = null;
   #colBuf = new Uint32Array(0);
+  /** Row maps of the main area, the zoom box and the A-scope (each has its own window). */
+  #mainRows = new RowMap();
+  #zoomRows = new RowMap();
+  #scopeRows = new RowMap();
 
   /** Build the trace element (echo and overlay canvases, settings gear) and track its size and pixel ratio. */
   constructor(channel: ChannelName, store: ColumnStore, label: string) {
@@ -92,8 +140,11 @@ export class TraceView {
     mq?.addEventListener?.('change', () => { this.#resize(); this.#watchDpr(); }, { once: true });
   }
 
-  /** True when the trace is laid out with a non-zero width. */
-  get visible(): boolean { return this.el.offsetParent !== null && this.#cssW > 0; }
+  /**
+   * True when the trace is shown with a non-zero width. Views hide traces with `hidden`; the width
+   * is the last one the ResizeObserver reported, so no layout is read per frame.
+   */
+  get visible(): boolean { return !this.el.hidden && this.#cssW > 0; }
   /** True when following new pings (not paused or scrolled back). */
   get live(): boolean { return this.endN === null; }
   /** Column number at the right edge: the paused position or the newest column. */
@@ -105,8 +156,17 @@ export class TraceView {
   /** CSS px per column as drawn; what a drag of that many px scrolls by one column. */
   get cssPerColumn(): number { return this.colW / this.#rs; }
 
-  /** Mark the trace for redraw on the next frame. */
-  invalidate(): void { this.#dirty = true; }
+  /**
+   * Mark the trace for redraw on the next frame: what changed (e.g. new columns), or with `all`
+   * everything, without trusting what the canvases show (e.g. after the page was hidden).
+   */
+  invalidate(all = false): void {
+    this.#dirty = true;
+    if (all) {
+      this.#shown = null;
+      this.#ovDirty = true;
+    }
+  }
 
   /** Size the canvases to the element (echogram at up to 1.5x DPR, overlay at full DPR) and force a redraw. */
   #resize(): void {
@@ -123,8 +183,10 @@ export class TraceView {
       this.#img.height = h;
       this.#image = null;
     }
+    // Setting a canvas size clears it, even to the same size.
     this.#ov.width = Math.max(1, Math.round(this.#cssW * this.#dpr));
     this.#ov.height = Math.max(1, Math.round(this.#cssH * this.#dpr));
+    this.#ovDirty = true;
     this.#dirty = true;
   }
 
@@ -135,9 +197,8 @@ export class TraceView {
     return layout(this.#cssW, this.zoomed, this.aScope && this.channel === 'sonar');
   }
 
-  /** Device px widths of the echogram area and the zoom box (what the columns are laid out in). */
-  #devLayout(): { mainW: number; zbW: number } {
-    const L = this.layout();
+  /** Device px widths of the echogram area and the zoom box (what the columns are laid out in) for layout `L`. */
+  #devLayout(L = this.layout()): { mainW: number; zbW: number } {
     return { mainW: Math.round(L.main * this.#rs), zbW: Math.round(L.zoomBox * this.#rs) };
   }
 
@@ -237,9 +298,9 @@ export class TraceView {
     if (changed) this.#dirty = true;
   }
 
-  /** Fit a zoom window in the full range within the zoom limits; null when it is (nearly) the full range. */
-  #clamp(w: Window): Window | null {
-    return clampZoom(w, this.fullWindow());
+  /** Fit a zoom window in the full range `full` within the zoom limits; null when it is (nearly) the full range. */
+  #clamp(w: Window, full = this.fullWindow()): Window | null {
+    return clampZoom(w, full);
   }
 
   /** Replace the zoom window, marking the trace dirty only when it differs. */
@@ -255,11 +316,12 @@ export class TraceView {
    * tracked bottom when it is in view, else around the middle.
    */
   zoomBy(factor: number, anchorY?: number): void {
-    const w = this.window();
+    const full = this.fullWindow();
+    const w = this.zoom ?? full;
     const bottom = this.trackBottom ? (this.refColumn()?.bottomCm ?? null) : null;
     const fy = anchorY === undefined ? undefined : this.#cssH > 0 ? anchorY / this.#cssH : 0.5;
     this.#anim = null;
-    this.#setZoom(this.#clamp(zoomWindow(w, factor, fy, bottom)));
+    this.#setZoom(this.#clamp(zoomWindow(w, factor, fy, bottom), full));
     this.#afterManualMove();
   }
 
@@ -293,8 +355,8 @@ export class TraceView {
     this.#lastTrackY = b === null ? -1e9 : ((b - w.top) / (w.bottom - w.top)) * this.#cssH;
   }
 
-  /** Keep the bottom near 75 % of the height while zoomed and live (app: t()). */
-  #followBottom(now: number): void {
+  /** Keep the bottom near 75 % of the height while zoomed and live (app: t()); `full` is the full window. */
+  #followBottom(now: number, full: Window): void {
     if (!this.zoom || !this.live || !this.trackBottom) return;
     const b = this.refColumn()?.bottomCm ?? null;
     if (b === null) return;
@@ -302,7 +364,7 @@ export class TraceView {
     const h = w.bottom - w.top;
     const y = ((b - w.top) / h) * this.#cssH;
     if (Math.abs(y - this.#lastTrackY) <= RETRACK_PX && y > 0 && y < this.#cssH) return;
-    const target = this.#clamp({ top: b - BOTTOM_AT * h, bottom: b - BOTTOM_AT * h + h });
+    const target = this.#clamp({ top: b - BOTTOM_AT * h, bottom: b - BOTTOM_AT * h + h }, full);
     if (!target) return;
     const ty = ((b - target.top) / h) * this.#cssH;
     // The range limits keep the bottom out of view: stop following instead of retrying every frame.
@@ -324,13 +386,13 @@ export class TraceView {
       if (this.endN < m) this.#setRight(m);
     }
     const full = this.fullWindow();
-    const fullKey = `${full.top}:${full.bottom}`;
-    if (fullKey !== this.#lastFull) {
-      if (this.#lastFull && this.zoom) this.resetZoom(); // new range: the old zoom may lie outside it
-      this.#lastFull = fullKey;
+    const last = this.#lastFull;
+    if (!last || last.top !== full.top || last.bottom !== full.bottom) {
+      if (last && this.zoom) this.resetZoom(); // new range: the old zoom may lie outside it
+      this.#lastFull = full;
       this.#dirty = true;
     }
-    this.#followBottom(now);
+    this.#followBottom(now, full);
     if (this.#anim) {
       const k = Math.min(1, (now - this.#anim.t0) / 500);
       const e = k < 0.5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2;
@@ -341,62 +403,112 @@ export class TraceView {
     }
     if (!this.#dirty) return false;
     this.#dirty = false;
-    this.#drawEcho();
-    this.#drawOverlay();
+    const w = this.zoom ?? full;
+    const L = this.layout();
+    const { mainW, zbW } = this.#devLayout(L);
+    this.store.reserve(visibleColumns(mainW, this.colW)); // keep at least a screenful (wide screen, slow speed)
+    this.#drawEcho(L, mainW, zbW, w, full);
+    // A new column alone leaves the rulers as they are: redraw them only when what they show changed.
+    const key = this.#overlayKey(L, w, full);
+    if (this.#ovDirty || key.some((v, i) => v !== this.#ovKey[i])) {
+      this.#ovDirty = false;
+      this.#ovKey = key;
+      this.#drawOverlay(L, w, full);
+    }
     return true;
   }
 
-  /** Render echogram, zoom box and A-scope; plain live scrolling only shifts the image and adds new pings. */
-  #drawEcho(): void {
+  /** Everything #drawOverlay and #ruler read: canvas size and ratio, layout, both windows, unit, offset, depth lines. */
+  #overlayKey(L: Layout, w: Window, full: Window): unknown[] {
+    return [this.#cssW, this.#cssH, this.#dpr, L.main, L.zoomBox, L.aScope, w.top, w.bottom, full.top, full.bottom,
+      this.unit.id, this.offsetCm, this.depthLines];
+  }
+
+  /**
+   * Render echogram, zoom box and A-scope for layout `L` (device px `mainW`, `zbW`), main window `w` and
+   * full window `full`. When only the right-edge column moved, the main area and the zoom box scroll:
+   * the canvas picture is shifted and only the uncovered strip is computed and put. #pix is therefore
+   * current only where it was written this frame, and every putImageData covers exactly those pixels.
+   */
+  #drawEcho(L: Layout, mainW: number, zbW: number, w: Window, full: Window): void {
     const W = this.#img.width, H = this.#img.height;
     if (!this.#image || this.#image.width !== W || this.#image.height !== H) {
       this.#image = new ImageData(W, H);
       this.#pix = new Uint32Array(this.#image.data.buffer);
       this.#shown = null;
     }
-    const pix = this.#pix!;
+    const image = this.#image, pix = this.#pix!;
     const pal = lut(this.palette);
-    const L = this.layout();
-    const { mainW, zbW } = this.#devLayout();
     const colW = this.colW;
     const right = this.right;
-    const w = this.window();
+    const gen = this.store.generation;
     const ctx = this.#img.getContext('2d')!;
-    // Live scrolling with nothing else changed: move the picture left and draw only the new pings.
-    const prev = this.#shown;
-    const shift = prev ? (right - prev.right) * colW : 0;
-    const incremental = !!prev && prev.W === W && prev.H === H && prev.mainW === mainW && prev.zbW === zbW
-      && prev.colW === colW && prev.top === w.top && prev.bottom === w.bottom && prev.palette === this.palette
-      && shift > 0 && shift < mainW && Number.isInteger(shift);
-    const from = incremental ? mainW - shift : 0;
-    if (incremental) ctx.drawImage(this.#img, shift, 0, mainW - shift, H, 0, 0, mainW - shift, H);
-    this.#columns(pix, W, H, from, mainW, colW, right, w, pal);
-    if (zbW > 0) this.#columns(pix, W, H, mainW, mainW + zbW, 1, right, this.fullWindow(), pal);
-    if (L.aScope > 0) this.#aScope(pix, W, H, mainW + zbW, W, this.fullWindow(), pal);
-    if (incremental) ctx.putImageData(this.#image, 0, 0, from, 0, W - from, H);
-    else ctx.putImageData(this.#image, 0, 0);
-    this.#shown = { W, H, mainW, zbW, colW, right, top: w.top, bottom: w.bottom, palette: this.palette };
+    /** Put the pixels [x0, x1) of every row, written to #pix this frame, on the canvas. */
+    const put = (x0: number, x1: number) => { if (x1 > x0) ctx.putImageData(image, 0, 0, x0, 0, x1 - x0, H); };
+    // The canvas can only be scrolled if it shows columns drawn at this size, palette and store generation.
+    const p = this.#shown;
+    const keep = p !== null && p.W === W && p.H === H && p.palette === this.palette && p.gen === gen;
+    const d = p ? right - p.right : 0; // columns moved (positive = newer)
+    // Areas, clipped to the canvas: main [0, m1), zoom box [m1, z1), A-scope (or a rounding pixel) [z1, W).
+    const m1 = Math.min(mainW, W), z1 = Math.min(mainW + zbW, W);
+    const mainKept = keep && p.mainW === mainW && p.colW === colW && p.top === w.top && p.bottom === w.bottom;
+    const [a0, a1] = this.#scroll(ctx, H, 0, m1, mainKept ? d * colW : null);
+    this.#columns(pix, W, H, a0, a1, mainW, colW, right, w, pal, this.#mainRows);
+    put(a0, a1);
+    if (zbW > 0) {
+      const zoomKept = keep && p.mainW === mainW && p.zbW === zbW && p.fullTop === full.top && p.fullBottom === full.bottom;
+      const [b0, b1] = this.#scroll(ctx, H, m1, z1, zoomKept ? d : null);
+      this.#columns(pix, W, H, b0, b1, mainW + zbW, 1, right, full, pal, this.#zoomRows);
+      put(b0, b1);
+    }
+    // Small: always redrawn.
+    if (L.aScope > 0) this.#aScope(pix, W, H, z1, W, right, full, pal);
+    else for (let y = 0; y < H; y++) pix.fill(pal[0], y * W + z1, y * W + W);
+    put(z1, W);
+    this.#shown = { W, H, mainW, zbW, colW, right, top: w.top, bottom: w.bottom, fullTop: full.top, fullBottom: full.bottom, palette: this.palette, gen };
   }
 
-  /** Fill pixel columns [x0, x1) with pings ending at column `right` at x1, `colW` px each. */
-  #columns(pix: Uint32Array, W: number, H: number, x0: number, x1: number, colW: number, right: number, win: Window, pal: Uint32Array): void {
+  /**
+   * Shift the canvas picture in device px [a0, a1) left by `shift` px (negative: right) and return
+   * the strip [x0, x1) that is left to draw: the uncovered one, none for no shift, or the whole area
+   * when `shift` is null (the picture cannot be reused) or at least as wide as the area.
+   */
+  #scroll(ctx: CanvasRenderingContext2D, H: number, a0: number, a1: number, shift: number | null): [number, number] {
+    const width = a1 - a0;
+    if (shift === null || Math.abs(shift) >= width) return [a0, a1];
+    if (shift > 0) {
+      ctx.drawImage(this.#img, a0 + shift, 0, width - shift, H, a0, 0, width - shift, H);
+      return [a1 - shift, a1];
+    }
+    if (shift < 0) {
+      ctx.drawImage(this.#img, a0, 0, width + shift, H, a0 - shift, 0, width + shift, H);
+      return [a0, a0 - shift];
+    }
+    return [a0, a0];
+  }
+
+  /**
+   * Fill pixel columns [x0, x1) of an area whose right edge is `xr` (exclusive) with pings ending
+   * at column `right` at xr, `colW` px each, in window `win`.
+   */
+  #columns(pix: Uint32Array, W: number, H: number, x0: number, x1: number, xr: number, colW: number, right: number,
+    win: Window, pal: Uint32Array, rows: RowMap): void {
     const bg = pal[0];
     if (this.#colBuf.length !== H) this.#colBuf = new Uint32Array(H);
     const buf = this.#colBuf;
-    const span = win.bottom - win.top;
     let lastN = NaN;
     let have = false;
     for (let x = x1 - 1; x >= x0; x--) {
-      const n = columnAt(right, x1, x, colW);
+      const n = columnAt(right, xr, x, colW);
       if (n !== lastN) {
         lastN = n;
         const c = this.store.get(n);
         have = !!c && c.endCm > 0;
-        if (c && have) {
-          const s = c.samples, len = s.length, k = len / c.endCm;
+        if (have) {
+          const s = c!.samples, map = rows.get(s.length, c!.endCm, win, H);
           for (let y = 0; y < H; y++) {
-            const i = Math.floor((win.top + ((y + 0.5) / H) * span) * k);
-            buf[y] = i >= 0 && i < len ? pal[s[i]] : bg;
+            const i = map[y];
+            buf[y] = i < 0 ? bg : pal[s[i]];
           }
         }
       }
@@ -405,17 +517,17 @@ export class TraceView {
     }
   }
 
-  /** Draw the right-most shown ping in [x0, x1) as centred bars, width proportional to echo strength. */
-  #aScope(pix: Uint32Array, W: number, H: number, x0: number, x1: number, win: Window, pal: Uint32Array): void {
-    const c = this.store.get(this.right);
+  /** Draw ping `right` in [x0, x1) as centred bars, width proportional to echo strength. */
+  #aScope(pix: Uint32Array, W: number, H: number, x0: number, x1: number, right: number, win: Window, pal: Uint32Array): void {
+    const c = this.store.get(right);
+    const map = c ? this.#scopeRows.get(c.samples.length, c.endCm, win, H) : null;
     const bg = pal[0];
     const width = x1 - x0;
-    const span = win.bottom - win.top;
     for (let y = 0; y < H; y++) {
       let v = 0;
-      if (c) {
-        const i = Math.floor((win.top + ((y + 0.5) / H) * span) * (c.samples.length / c.endCm));
-        if (i >= 0 && i < c.samples.length) v = c.samples[i];
+      if (c && map) {
+        const i = map[y];
+        if (i >= 0) v = c.samples[i];
       }
       const half = (v / 255) * width / 2;
       const mid = x0 + width / 2;
@@ -424,21 +536,18 @@ export class TraceView {
     }
   }
 
-  /** Draw the depth rulers and, when zoomed, the zoom box's window marker and its own ruler. */
-  #drawOverlay(): void {
+  /** Draw the depth rulers for layout `L` and main window `w` and, when zoomed, the zoom box's window marker and its ruler for `full`. */
+  #drawOverlay(L: Layout, w: Window, full: Window): void {
     const ctx = this.#ov.getContext('2d')!;
     const d = this.#dpr;
     ctx.setTransform(d, 0, 0, d, 0, 0);
     ctx.clearRect(0, 0, this.#cssW, this.#cssH);
-    const L = this.layout();
     const H = this.#cssH;
-    this.#ruler(ctx, L.main, H, this.window(), true);
+    this.#ruler(ctx, L.main, H, w, true);
     if (L.zoomBox > 0) {
       const x0 = L.main, x1 = L.main + L.zoomBox;
-      const full = this.fullWindow();
-      const z = this.window();
-      const y0 = ((z.top - full.top) / (full.bottom - full.top)) * H;
-      const y1 = ((z.bottom - full.top) / (full.bottom - full.top)) * H;
+      const y0 = ((w.top - full.top) / (full.bottom - full.top)) * H;
+      const y1 = ((w.bottom - full.top) / (full.bottom - full.top)) * H;
       ctx.fillStyle = 'rgba(0, 196, 229, 0.30)';
       ctx.fillRect(x0 + 1, y0, x1 - x0 - 2, y1 - y0);
       ctx.strokeStyle = '#fff';

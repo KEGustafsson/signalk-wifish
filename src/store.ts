@@ -28,9 +28,6 @@ export function parseDisplayPatch(body: unknown): DisplayPrefs | string {
   return Object.keys(out).length ? out : 'empty patch';
 }
 
-/** Largest waterline-to-transducer distance, cm: the same limit the sonar puts on its own offset. */
-export const MAX_SURFACE_TO_TRANSDUCER_CM = MAX_TRANSDUCER_OFFSET_CM;
-
 /** Validated vessel settings patch, or an error string. */
 export function parseVesselPatch(body: unknown): VesselSettings | string {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return 'expected a JSON object';
@@ -39,8 +36,9 @@ export function parseVesselPatch(body: unknown): VesselSettings | string {
   for (const k of Object.keys(b)) {
     if (k === 'surfaceToTransducerCm') {
       const v = b[k];
-      if (v !== null && (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > MAX_SURFACE_TO_TRANSDUCER_CM)) {
-        return `surfaceToTransducerCm must be 0..${MAX_SURFACE_TO_TRANSDUCER_CM} or null`;
+      // The same limit the sonar puts on its own offset.
+      if (v !== null && (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > MAX_TRANSDUCER_OFFSET_CM)) {
+        return `surfaceToTransducerCm must be 0..${MAX_TRANSDUCER_OFFSET_CM} or null`;
       }
       out.surfaceToTransducerCm = v === null ? null : Math.round(v);
     } else {

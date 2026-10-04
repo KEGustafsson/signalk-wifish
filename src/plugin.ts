@@ -216,13 +216,8 @@ export function plugin(app: ServerApp) {
       /** Handler for one route (`fixed` path) or for any path (from the request). */
       const route = (fixed?: string): Handler => (req, res, next) => {
         const p = fixed ?? req.path ?? new URL(req.url ?? '/', 'http://x').pathname;
-        let result: Promise<boolean>;
-        try {
-          result = api.handle(req, res, p);
-        } catch (e) {
-          result = Promise.reject(e);
-        }
-        result.then((handled) => { if (!handled) next(); }, (e) => {
+        // handle() is async: whatever it throws arrives as a rejection.
+        api.handle(req, res, p).then((handled) => { if (!handled) next(); }, (e) => {
           // Not Express's default handler (an HTML page, or the server's own error format): a plain 500.
           error(`${req.method ?? 'GET'} ${p}: ${errorMessage(e)}`);
           if (res.headersSent) { res.end(); return; }

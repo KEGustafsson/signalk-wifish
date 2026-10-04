@@ -26,6 +26,22 @@
 - Accessibility of the gear button and the history scrollbar (keyboard, labels).
 - `tools/wifish-probe.mjs` exits with a message, not a stack trace, on a bad `--log`
   or `--replay` path; `tools/dump-raw.mjs --id ''` is a usage error.
+- Sonar data from any address other than the locked-on sonar's kept a dead session alive
+  (a second unit in range, or the same unit back on a new address) while keepalives and
+  settings went to the old one. Only the sonar's own data counts now.
+- A configured Wi-Fi interface address that does not exist is a plugin error, retried
+  every 5 s, instead of a silent "Looking for" that never recovered.
+- A sonar that went away shows "Sonar offline. Looking for…" instead of the message for
+  one never found.
+- A unit that rebooted within 20 s (lower settings sequence numbers) was ignored until
+  its numbers caught up; after a lost link its next settings are taken.
+- A depth or temperature change held back by the rate limit went out up to 1 s late; it
+  now goes out as soon as the limit allows (200 ms for depth).
+- No duplicate `null` depth after the sonar is found again.
+- The gear button's background was a faint red (an Android `#AARRGGBB` colour read as CSS).
+- Echogram popovers have accessible names, their buttons report `aria-expanded`, and the
+  overflow menu works with the arrow keys.
+- Settings edited and then applied by closing the tab are sent reliably (`keepalive`).
 
 ### Changed
 
@@ -33,11 +49,28 @@
 - SSE backlog for a new viewer capped at about 2 MiB.
 - Sourcemaps dropped from the production bundle.
 - CI runs once per PR (push only on `main` and tags) and tests Node 20 as well.
+- Server history holds each column once (it also held a copy as an SSE frame, doubling
+  its memory with a viewer connected); a new viewer's backlog is merged from the newest
+  end instead of sorting the whole history.
+- An unchanged state is no longer sent to every viewer each second.
+- The browser keeps as many columns as the server (at least a screenful), not 20 000
+  per channel.
+- Echogram drawing: the rulers are redrawn only when they change, the zoom box and
+  backward scrolling are incremental, and a cached row map makes a full redraw about
+  40 % faster. No layout read per frame; snapshots are encoded off the main thread.
+- A short Wi-Fi drop the browser reconnects from by itself no longer flashes the
+  connecting overlay.
+- Replay keeps record offsets instead of an object per record.
+- The build runs on `npm pack` / publish (`prepack`) instead of on every install.
 
 ### Internal
 
 - Shared constants (units, sources, channels, device timing, used by the probe too).
 - Tests for the device transport, replay, plugin, CLI tools, trace geometry and prefs.
+- Tests are type-checked (`npm test` runs `typecheck` first). The device transport is
+  tested through loss, give-up, re-acquire, the sender filter and missing interfaces.
+  The suite runs in about 2 s instead of 3.6 s (no real sleeps, concurrent tool runs).
+- `tools/wifish-probe.mjs` shares interface selection with the plugin.
 
 ## 0.1.0
 
