@@ -39,7 +39,10 @@
       <div id="offline" class="offline" hidden>
         <h1>Sonar offline</h1>
         <p id="offline-hint">To view sonar, join this Signal K server to a Wi-Fish or Dragonfly Pro Wi-Fi access point.</p>
-        <button id="btn-retry" class="connect-btn">Retry</button>
+        <div class="offline-buttons">
+          <button id="btn-retry" class="connect-btn">Retry</button>
+          <button id="btn-demo" class="connect-btn" title="Show a simulated sonar on this page; the real one is not affected">Sonar demo</button>
+        </div>
       </div>
       <p id="connect-msg" class="connect-msg"></p>
     </section>

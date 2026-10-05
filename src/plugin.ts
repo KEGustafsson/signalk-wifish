@@ -91,7 +91,7 @@ export const schema = {
       type: 'string',
       title: 'Demo model',
       enum: DEMO_MODELS,
-      description: 'dragonfly = CHIRP sonar + DownVision, wifish = DownVision only',
+      description: 'dragonfly = CHIRP sonar + DownVision, wifish = DownVision only. Also the sonar the web app\'s "Sonar demo" button shows.',
       default: 'dragonfly',
     },
     historyColumns: {
@@ -139,7 +139,21 @@ export function plugin(app: ServerApp) {
   /** The web app's display units and the vessel settings, saved in the plugin's data directory. */
   const display = new DisplayStore(dataFile('display.json'), { debug, error });
   const vessel = new VesselStore(dataFile('vessel.json'), { debug, error });
-  const api = new Api(() => engine, display, vessel, { error });
+  /** Config of the current run, for the web app's demo engine. */
+  let current: PluginConfig = {};
+  /**
+   * Engine for the web app's "Sonar demo": a simulated sonar for the viewers that ask for it,
+   * whatever the configured source. Nothing it reads is published to Signal K.
+   */
+  const demo = () => new Engine(new DemoDevice({ model: isDemoModel(current.demoModel) ? current.demoModel : 'dragonfly' }), {
+    historyColumns: current.historyColumns,
+    emitDepth: false,
+    emitTemperature: false,
+    surfaceToTransducerCm: () => vessel.get().surfaceToTransducerCm ?? null,
+    log: debug,
+    error,
+  });
+  const api = new Api(() => engine, display, vessel, { error, demo });
 
   /** Show link changes as plugin status; 'offline' (other than after stop) as a plugin error. */
   const status = (link: LinkState, msg: string) => {
@@ -166,6 +180,7 @@ export function plugin(app: ServerApp) {
       shutdown(); // a second start without stop must not leak the first engine's sockets
       try {
         const cfg: PluginConfig = { ...config };
+        current = cfg;
         if (cfg.source === 'replay') {
           const file = cfg.replayFile?.trim() ?? '';
           // Not a silent fallback to the demo: the user picked a replay and must see why none plays.

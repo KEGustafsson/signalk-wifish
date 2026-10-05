@@ -10,6 +10,11 @@
 //   GET  api/vessel            VesselSettings (waterline-to-transducer distance)
 //   POST api/vessel            VesselSettings patch
 //
+// `?demo=1` on api/state, api/stream, api/channel and api/system addresses the demo sonar
+// instead: an engine of its own, started while the plugin runs and a viewer streams it,
+// that publishes nothing to Signal K. Its stream also carries "sonar" events with the
+// real sonar's link state, so a demo viewer can offer to switch back.
+//
 // Under Signal K the GETs are registered for readonly users and the POSTs for readwrite
 // users (plugin.ts); on a server without per-route plugin access every route is admin-only.
 // A readonly principal sees canControl false in every state it is sent, and a POST that
@@ -18,7 +23,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Engine, HistoryEntry } from './engine';
 import { DisplayStore, VesselStore, parseDisplayPatch, parseVesselPatch } from './store';
-import { isChannelName, type ChannelName, type ChannelPatch, type SystemPatch, type WifishState } from './shared/api';
+import { isChannelName, type ChannelName, type ChannelPatch, type LinkState, type SystemPatch, type WifishState } from './shared/api';
 import { MAX_RANGE_CM, MAX_TRANSDUCER_OFFSET_CM, MIN_RANGE_WINDOW_CM } from './shared/units';
 import { errorMessage } from './util';
 
@@ -47,6 +52,11 @@ export const MAX_BACKLOG_BYTES = 2 * 1024 * 1024;
 export const MAX_BODY_BYTES = 16 * 1024;
 /** SSE comment keeping idle streams alive through proxies. */
 const PING_MS = 15_000;
+/** The demo engine runs on this long after its last viewer left, so a reconnecting viewer keeps its history. */
+export const DEMO_IDLE_MS = 30_000;
+
+/** The request is for the demo sonar (`?demo=1`). */
+const isDemo = (req: Req): boolean => /[?&]demo=1(?:&|$)/.test(req.url ?? '');
 
 /** The Signal K principal may look but not change anything (anonymous readonly access included). */
 const isReadonly = (req: Req): boolean => req.skIsAuthenticated === true && req.skPrincipal?.permissions === 'readonly';
@@ -181,6 +191,8 @@ interface Client {
   res: Res;
   /** Signal K readonly principal: every state it gets says canControl false. */
   readonly: boolean;
+  /** Streams the demo engine instead of the plugin's. */
+  demo: boolean;
   /** Live frames held back while the backlog drains, so columns stay in order; null once live. */
   queue: string[] | null;
   /** Bytes in `queue`. */
@@ -191,7 +203,12 @@ interface Client {
 export interface ApiOptions {
   /** Where failures are reported (a handler that threw, a stream that failed). */
   error?: (msg: string) => void;
+  /** Builds the (not yet started) engine demo viewers get; it must not publish to Signal K. No demo without it. */
+  demo?: () => Engine;
 }
+
+/** The real sonar's link as demo viewers are told it: null while the plugin is not running. */
+export interface SonarLink { link: LinkState | null }
 
 export class Api {
   #engine: () => Engine | null;
@@ -201,6 +218,12 @@ export class Api {
   #display: DisplayStore;
   #vessel: VesselStore;
   #error: (msg: string) => void;
+  #makeDemo: (() => Engine) | null;
+  #demo: Engine | null = null;
+  #demoUnsub: (() => void) | null = null;
+  #demoIdle: NodeJS.Timeout | null = null;
+  /** Link last sent to demo viewers in a "sonar" event. */
+  #sonarLink: LinkState | null = null;
 
   /**
    * `engine` is a getter so the plugin can swap engines on restart; `display` keeps the
@@ -211,6 +234,7 @@ export class Api {
     this.#display = display;
     this.#vessel = vessel;
     this.#error = opts.error ?? (() => {});
+    this.#makeDemo = opts.demo ?? null;
   }
 
   /** Route a request whose path is relative to the plugin root. Returns false when not ours. */
@@ -219,8 +243,8 @@ export class Api {
     if (method === 'GET') {
       switch (path) {
         case '/api/state': {
-          const engine = this.#engine();
-          return engine ? reply(res, 200, this.#stateFor(engine, isReadonly(req))) : reply(res, 503, { error: 'plugin not running' });
+          const engine = isDemo(req) ? this.#demo : this.#engine();
+          return engine ? reply(res, 200, this.#stateFor(engine, isReadonly(req))) : reply(res, 503, { error: isDemo(req) ? 'demo not running' : 'plugin not running' });
         }
         case '/api/display': return reply(res, 200, this.#display.get());
         case '/api/vessel': return reply(res, 200, this.#vessel.get());
@@ -263,11 +287,13 @@ export class Api {
         if (typeof patch === 'string') return reply(res, 400, { error: patch });
         const v = this.#vessel.set(patch);
         this.#engine()?.vesselChanged();
+        this.#demo?.vesselChanged();
         this.#broadcast('vessel', v);
         return reply(res, 200, v);
       }
-      const engine = this.#engine(); // read after the body: the plugin may have restarted meanwhile
-      if (!engine) return reply(res, 503, { error: 'plugin not running' });
+      // Read after the body: the plugin may have restarted meanwhile.
+      const engine = isDemo(req) ? this.#demo : this.#engine();
+      if (!engine) return reply(res, 503, { error: isDemo(req) ? 'demo not running' : 'plugin not running' });
       let err: string | null;
       if (channel) {
         const patch = parseChannelPatch(body);
@@ -285,26 +311,94 @@ export class Api {
     }
   }
 
-  /** Call after the engine was (re)created so live events reach connected viewers. */
+  /**
+   * Call after the engine was (re)created or stopped so live events reach connected viewers.
+   * The demo runs only while the plugin does: it is stopped with the plugin and started again
+   * for the demo viewers still connected when the plugin is.
+   */
   bind(): void {
     const engine = this.#engine();
-    if (engine === this.#bound) return;
-    this.#unsub?.();
-    this.#unsub = null;
-    this.#bound = engine;
-    if (!engine) {
-      this.#broadcast('state', null);
-      return;
+    if (engine !== this.#bound) {
+      this.#unsub?.();
+      this.#unsub = null;
+      this.#bound = engine;
+      if (engine) {
+        const unsub = this.#attach(engine, false);
+        /** Tell demo viewers when the real sonar's link changes. */
+        const onState = (s: WifishState) => this.#sonar(s.link);
+        engine.on('state', onState);
+        this.#unsub = () => { unsub(); engine.off('state', onState); };
+        this.#sonar(engine.state().link);
+      } else {
+        this.#broadcast('state', null, false);
+        this.#sonar(null);
+      }
     }
-    /** Forward engine state changes to every viewer. */
-    const onState = (s: WifishState) => this.#broadcast('state', s);
-    /** Forward each new echogram column, serialised once by the engine, to every viewer. */
-    const onCol = (_c: unknown, json: string) => this.#broadcastFrame(rawFrame('col', json));
+    if (!engine) this.#stopDemo(true);
+    else if (this.#demoViewers()) this.#startDemo();
+  }
+
+  /** Forward an engine's state changes and columns to its viewers (demo or not); returns the unsubscribe. */
+  #attach(engine: Engine, demo: boolean): () => void {
+    /** Forward engine state changes to the engine's viewers. */
+    const onState = (s: WifishState) => this.#broadcast('state', s, demo);
+    /** Forward each new echogram column, serialised once by the engine, to the engine's viewers. */
+    const onCol = (_c: unknown, json: string) => this.#broadcastFrame(rawFrame('col', json), undefined, demo);
     engine.on('state', onState);
     engine.on('column', onCol);
-    this.#unsub = () => { engine.off('state', onState); engine.off('column', onCol); };
-    this.#broadcast('reset', null);
-    this.#broadcast('state', engine.state());
+    this.#broadcast('reset', null, demo);
+    this.#broadcast('state', engine.state(), demo);
+    return () => { engine.off('state', onState); engine.off('column', onCol); };
+  }
+
+  /** Send demo viewers the real sonar's link when it changed. */
+  #sonar(link: LinkState | null): void {
+    if (link === this.#sonarLink) return;
+    this.#sonarLink = link;
+    this.#broadcast('sonar', { link } satisfies SonarLink, true);
+  }
+
+  /** The running demo engine, started first if needed; null when the plugin is not running or has no demo. */
+  #startDemo(): Engine | null {
+    this.#cancelDemoIdle();
+    if (this.#demo) return this.#demo;
+    if (!this.#makeDemo || !this.#engine()) return null;
+    let e: Engine;
+    try {
+      e = this.#makeDemo();
+    } catch (err) {
+      this.#error(`demo: ${errorMessage(err)}`);
+      return null;
+    }
+    this.#demo = e;
+    this.#demoUnsub = this.#attach(e, true);
+    e.start();
+    return e;
+  }
+
+  /** Stop the demo engine, if running; `tell` its viewers it is gone (state null). */
+  #stopDemo(tell: boolean): void {
+    this.#cancelDemoIdle();
+    const e = this.#demo;
+    if (!e) return;
+    this.#demo = null;
+    this.#demoUnsub?.();
+    this.#demoUnsub = null;
+    e.stop();
+    if (tell) this.#broadcast('state', null, true);
+  }
+
+  /** Cancel a pending idle stop of the demo. */
+  #cancelDemoIdle(): void {
+    if (this.#demoIdle) clearTimeout(this.#demoIdle);
+    this.#demoIdle = null;
+  }
+
+  /** Connected demo viewers. */
+  #demoViewers(): number {
+    let n = 0;
+    for (const c of this.#clients.values()) if (c.demo) n++;
+    return n;
   }
 
   /** Detach from the engine and end every viewer's event stream. */
@@ -312,6 +406,7 @@ export class Api {
     this.#unsub?.();
     this.#unsub = null;
     this.#bound = null;
+    this.#stopDemo(false);
     for (const c of [...this.#clients.values()]) {
       this.#forget(c);
       c.res.end();
@@ -339,19 +434,22 @@ export class Api {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
-    const client: Client = { res, readonly: isReadonly(req), queue: [], queued: 0, ping: null };
+    const demo = isDemo(req);
+    // Started before the viewer is registered: the new engine's reset and state go to the others.
+    const engine = demo ? this.#startDemo() : this.#engine();
+    const client: Client = { res, readonly: isReadonly(req), demo, queue: [], queued: 0, ping: null };
     this.#clients.set(res, client);
     // The response closes when the viewer goes away or the stream ends ('close' on the request
     // can also mean only that its body was read).
     res.on('close', () => this.#forget(client));
     // An 'error' with no listener would take the server down; the stream is simply dropped.
     res.on('error', (e) => { this.#error(`event stream: ${errorMessage(e)}`); this.#drop(client); });
-    const engine = this.#engine();
     const head = [
       'retry: 2000\n\n',
       frame('display', this.#display.get()),
       frame('state', engine ? this.#stateFor(engine, client.readonly) : null),
       frame('vessel', this.#vessel.get()),
+      ...(demo ? [frame('sonar', { link: this.#sonarLink } satisfies SonarLink)] : []),
       ...(engine ? backlogFrames(engine) : []),
     ];
     this.#open(client, head).catch((e) => {
@@ -407,11 +505,13 @@ export class Api {
     client.res.flush?.();
   }
 
-  /** Stop pinging and forget the viewer. */
+  /** Stop pinging and forget the viewer; after the last demo viewer the demo stops DEMO_IDLE_MS later. */
   #forget(client: Client): void {
     if (client.ping) clearInterval(client.ping);
     client.ping = null;
-    this.#clients.delete(client.res);
+    if (!this.#clients.delete(client.res) || !client.demo || !this.#demo || this.#demoIdle || this.#demoViewers()) return;
+    this.#demoIdle = setTimeout(() => this.#stopDemo(false), DEMO_IDLE_MS);
+    this.#demoIdle.unref?.();
   }
 
   /** Forget the viewer and cut its connection (it reconnects after `retry` and gets a fresh backlog). */
@@ -420,19 +520,23 @@ export class Api {
     client.res.destroy();
   }
 
-  /** Send an event to every viewer, dropping any whose unread output exceeds its budget. */
-  #broadcast(event: string, data: unknown): void {
+  /**
+   * Send an event to every viewer (only the demo ones, or only the others, when `demo` is
+   * given), dropping any whose unread output exceeds its budget.
+   */
+  #broadcast(event: string, data: unknown, demo?: boolean): void {
     if (!this.#clients.size) return;
     /** The same state for readonly viewers, built once if any needs it. */
     let ro: string | null = null;
     const readonly = event === 'state' && data ? () => (ro ??= frame('state', { ...(data as WifishState), canControl: false })) : undefined;
-    this.#broadcastFrame(frame(event, data), readonly);
+    this.#broadcastFrame(frame(event, data), readonly, demo);
   }
 
-  /** Send a frame to every viewer (`readonly()` instead to readonly viewers, when given). */
-  #broadcastFrame(f: string, readonly?: () => string): void {
+  /** Send a frame to every viewer, or those whose `demo` matches (`readonly()` instead to readonly viewers, when given). */
+  #broadcastFrame(f: string, readonly?: () => string, demo?: boolean): void {
     if (!this.#clients.size) return;
     for (const c of this.#clients.values()) { // deleting the current entry while iterating a Map is safe
+      if (demo !== undefined && c.demo !== demo) continue;
       if (!this.#alive(c)) { this.#forget(c); continue; }
       // A viewer that stopped reading (stalled proxy, suspended tab) would buffer forever.
       if (c.res.writableLength + c.queued > MAX_UNREAD_BYTES) { this.#drop(c); continue; }
