@@ -259,6 +259,33 @@ describe('DeviceTransport on loopback', () => {
     expect(handles()).toBe(udpBefore);
   });
 
+  test('sonar switched off and its Wi-Fi address gone with it: "Sonar offline. Waiting for …" until it is back', async () => {
+    const sonar = await bound('127.0.0.1');
+    open.push(sonar);
+    const port = await freePort();
+    const group = '239.255.0.8';
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'performance'] });
+    const { t, links, states, errors } = make({ discovery: { group, port }, keepalive: false });
+    t.start();
+    await waitFor(() => links.find(([s]) => s === 'searching'));
+    await send(sonar, announceMsg(group, port, '127.0.0.1', 1), port);
+    await send(sonar, unitMsg(), port);
+    await send(sonar, bottomMsg(100), port);
+    await waitFor(() => (states().at(-1) === 'connected' ? true : undefined));
+    // The sonar is switched off: no more data, and its DHCP lease on this machine goes too.
+    const ifaces = vi.spyOn(os, 'networkInterfaces').mockReturnValue({ eth0: [ni('10.0.0.5', '255.255.255.0')] });
+    vi.advanceTimersByTime(TIMING.GIVE_UP_MS + 1000);
+    const waiting = 'Sonar offline. Waiting for Wi-Fi interface address 127.0.0.1: the sonar is off or this machine has not joined its Wi-Fi';
+    expect(links.at(-1)).toEqual(['searching', waiting]);
+    vi.advanceTimersByTime(2 * TIMING.RETRY_MS);
+    expect(links.at(-1)).toEqual(['searching', waiting]); // kept across retries
+    ifaces.mockRestore(); // switched on again: the address is back
+    vi.advanceTimersByTime(TIMING.RETRY_MS);
+    await waitFor(() => (links.at(-1)![1] === 'Sonar offline. Looking for a Wi-Fish / Dragonfly' ? true : undefined));
+    expect(links.some(([s]) => s === 'offline')).toBe(false);
+    expect(errors).toEqual([]);
+  });
+
   test('no interface: waiting (not an error), retried until one appears', async () => {
     const port = await freePort();
     const ifaces = vi.spyOn(os, 'networkInterfaces').mockReturnValue({ lo: [ni('127.0.0.1', '255.0.0.0', true)] });

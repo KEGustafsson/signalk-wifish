@@ -33,7 +33,7 @@
   DHCP has given this machine no address on its Wi-Fi), or no interface at all, is no
   longer a plugin error: the status reads "Waiting for Wi-Fi interface address …" and the
   interfaces are re-read every 5 s until it appears, instead of a silent "Looking for"
-  that never recovered.
+  that never recovered. After a lost sonar the status keeps saying "Sonar offline".
 - A sonar that went away shows "Sonar offline. Looking for…" instead of the message for
   one never found.
 - A unit that rebooted within 20 s (lower settings sequence numbers) was ignored until

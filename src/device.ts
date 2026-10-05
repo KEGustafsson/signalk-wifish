@@ -200,38 +200,40 @@ export class DeviceTransport extends EventEmitter<TransportEvents> implements Tr
     this.#close();
     this.#report('socket', why);
     this.#setLink('offline', why);
-    this.#retryLater();
+    this.#retryLater(false);
   }
 
   /**
    * No interface to listen on yet: the sonar is switched off, so its DHCP has not given this
    * machine an address on its Wi-Fi, or the Wi-Fi is not joined. That is a normal state, not
-   * an error: report 'searching' with `why` and look again every RETRY_MS.
+   * an error: report 'searching' with `why` and look again every RETRY_MS, keeping `lost`.
    */
-  #waitForInterface(why: string): void {
+  #waitForInterface(why: string, lost: boolean): void {
     if (this.#link !== 'searching' || this.#message !== why) this.#log(why);
     this.#setLink('searching', why);
-    this.#retryLater();
+    this.#retryLater(lost);
   }
 
-  /** Reopen after RETRY_MS while running, unless a reopen is already pending. */
-  #retryLater(): void {
+  /** Reopen (passing on `lost`) after RETRY_MS while running, unless a reopen is already pending. */
+  #retryLater(lost: boolean): void {
     if (!this.#running || this.#retry) return;
-    this.#retry = setTimeout(() => this.#safely('retry', () => { this.#retry = null; if (this.#running) this.#open(); }), TIMING.RETRY_MS);
+    this.#retry = setTimeout(() => this.#safely('retry', () => { this.#retry = null; if (this.#running) this.#open(lost); }), TIMING.RETRY_MS);
   }
 
   /**
-   * Bind the discovery socket, join its group on each candidate interface, report 'searching'
-   * with `searching` as the status, then start the interface rescan.
+   * Bind the discovery socket, join its group on each candidate interface, report 'searching',
+   * then start the interface rescan. `lost`: a sonar went away, which the status says (unlike
+   * a search that never found one), also while waiting for an interface.
    */
-  #open(searching = 'Looking for a Wi-Fish / Dragonfly'): void {
+  #open(lost = false): void {
+    const prefix = lost ? 'Sonar offline. ' : '';
     const { group, port } = this.#discovery;
     const { iface } = this.#opts;
     this.#candidates = candidatesFrom(os.networkInterfaces(), iface);
     if (!this.#candidates.length) {
-      return this.#waitForInterface(iface
+      return this.#waitForInterface(prefix + (iface
         ? `Waiting for Wi-Fi interface address ${iface}: the sonar is off or this machine has not joined its Wi-Fi`
-        : 'Waiting for a network interface: the sonar is off or this machine has not joined its Wi-Fi');
+        : 'Waiting for a network interface: the sonar is off or this machine has not joined its Wi-Fi'), lost);
     }
     const disc = dgram.createSocket({ type: 'udp4', reuseAddr: true });
     this.#disc = disc;
@@ -247,7 +249,7 @@ export class DeviceTransport extends EventEmitter<TransportEvents> implements Tr
       // join is refused (some BSD stacks), keep listening instead of giving up.
       if (!joined) this.#report('join', `could not join ${group} on any interface; listening anyway`);
       this.#log(`listening ${group}:${port} on ${this.#candidates.map((c) => c.address).join(', ')}`);
-      this.#setLink('searching', searching);
+      this.#setLink('searching', `${prefix}Looking for a Wi-Fish / Dragonfly`);
       // The sonar Wi-Fi often comes up after the server: while no session runs,
       // re-read the interfaces and rejoin discovery when they change.
       this.#rescan = setInterval(() => this.#safely('rescan', () => this.#rescanInterfaces()), TIMING.RETRY_MS);
@@ -378,9 +380,8 @@ export class DeviceTransport extends EventEmitter<TransportEvents> implements Tr
     if (quiet > TIMING.GIVE_UP_MS) {
       this.#log('no sonar data, rejoining discovery');
       // Reopen discovery too: a reconnected adapter may have dropped the socket's memberships.
-      // The status says the sonar went away, unlike a search that never found one.
       this.#close();
-      this.#open('Sonar offline. Looking for a Wi-Fish / Dragonfly');
+      this.#open(true);
       return;
     }
     if (quiet > TIMING.QUIET_MS && this.#link === 'connected') this.#setLink('lost', 'Trying to restore connection to the sounder');
