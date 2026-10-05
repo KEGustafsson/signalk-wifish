@@ -1,8 +1,8 @@
 // Connection to the plugin: SSE for state and columns, fetch for settings.
 
 import {
-  API_BASE, isChannelName, type ChannelName, type ChannelPatch, type ColumnMessage, type DisplayPrefs, type SystemPatch,
-  type VesselSettings, type WifishState,
+  API_BASE, isChannelName, type ChannelName, type ChannelPatch, type ColumnMessage, type DisplayPrefs, type LinkState,
+  type SystemPatch, type VesselSettings, type WifishState,
 } from '../../src/shared/api';
 
 export interface StreamHandlers {
@@ -13,7 +13,21 @@ export interface StreamHandlers {
   reset(): void;
   live(): void;
   connection(ok: boolean): void;
+  /** Demo stream only: the real sonar's link (null = plugin not running). */
+  sonar(link: LinkState | null): void;
 }
+
+/**
+ * This page shows the plugin's demo sonar instead of the real one: the stream and the sonar
+ * settings go to the demo engine. Kept for this page only, so a reload starts on the sonar.
+ */
+let demo = false;
+/** Use the demo sonar (or the real one again); takes effect on the next open() and settings change. */
+export function setDemo(on: boolean): void { demo = on; }
+/** True while this page shows the demo sonar. */
+export const isDemo = (): boolean => demo;
+/** Query addressing the demo engine, when in demo mode. */
+const demoQuery = (): string => (demo ? '?demo=1' : '');
 
 /** Reconnect delay after the browser gave up on the stream: 1 s doubling to 30 s. */
 export const RECONNECT_MIN_MS = 1000;
@@ -37,6 +51,9 @@ export function isState(v: unknown): v is WifishState | null {
     && isObj(v.channels) && isObj(v.active) && numOrNull(v.depthCm) && numOrNull(v.waterTempCentiC);
 }
 
+/** Shape check for a "sonar" event: the real sonar's link, null while the plugin is not running. */
+export const isSonarLink = (v: unknown): v is { link: LinkState | null } => isObj(v) && (v.link === null || typeof v.link === 'string');
+
 /** Shape check for an echogram column message. */
 export function isColumn(v: unknown): v is ColumnMessage {
   return isObj(v) && isChannelName(v.ch) && typeof v.n === 'number' && Number.isFinite(v.n)
@@ -59,7 +76,7 @@ export class PluginStream {
   /** (Re)connect the SSE stream and route its events to the handlers. */
   open(): void {
     this.#shut();
-    const es = new EventSource(`${API_BASE}/stream`);
+    const es = new EventSource(`${API_BASE}/stream${demoQuery()}`);
     this.#es = es;
     es.addEventListener('open', () => {
       this.#backoff = RECONNECT_MIN_MS;
@@ -79,6 +96,7 @@ export class PluginStream {
     this.#on(es, 'vessel', isObj, (v) => this.h.vessel(v as VesselSettings));
     this.#on(es, 'state', isState, (s) => this.h.state(s));
     this.#on(es, 'col', isColumn, (c) => this.h.column(c));
+    this.#on(es, 'sonar', isSonarLink, (v) => this.h.sonar(v.link));
     es.addEventListener('reset', () => this.#guard('reset', () => this.h.reset()));
     es.addEventListener('live', () => this.#guard('live', () => this.h.live()));
   }
@@ -179,9 +197,9 @@ async function post<T>(path: string, body: unknown, check: (v: unknown) => v is 
 const isLiveState = (v: unknown): v is WifishState => v !== null && isState(v);
 
 /** Change settings of one channel; resolves to the resulting plugin state. */
-export const setChannel = (ch: ChannelName, patch: ChannelPatch) => post(`/channel/${ch}`, patch, isLiveState);
+export const setChannel = (ch: ChannelName, patch: ChannelPatch) => post(`/channel/${ch}${demoQuery()}`, patch, isLiveState);
 /** Change sonar system settings; resolves to the resulting plugin state. */
-export const setSystem = (patch: SystemPatch) => post('/system', patch, isLiveState);
+export const setSystem = (patch: SystemPatch) => post(`/system${demoQuery()}`, patch, isLiveState);
 /** Save display units on the plugin for every viewer; resolves to the units now kept. */
 export const setDisplay = (patch: DisplayPrefs) => post('/display', patch, (v): v is DisplayPrefs => isObj(v));
 /** Save vessel settings on the plugin; resolves to the settings now kept. */

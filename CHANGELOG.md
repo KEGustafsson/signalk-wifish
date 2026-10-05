@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- Web app: a **Sonar demo** button next to Retry on the "Sonar offline" screen shows a
+  simulated sonar on that page only. The plugin runs it beside the real sonar (started for
+  the first demo viewer, stopped 30 s after the last one left, and only while the plugin
+  runs); it publishes nothing to Signal K and other viewers are not affected. ⋯ → Leave demo
+  returns to the sonar, the page offers to switch when the sonar comes online, and a reload
+  starts on the sonar again. API: `?demo=1` on `api/stream`, `api/state`, `api/channel/*`
+  and `api/system`; the demo stream carries "sonar" events with the real sonar's link.
+
 ### Fixed
 
 - Depth readout showed some values one tenth too low (2.30 m as 2.2 m): a floating-point

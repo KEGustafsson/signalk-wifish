@@ -3,7 +3,7 @@
 import { ColumnStore } from './history';
 import { TraceView } from './trace';
 import { clampSpeed } from './geometry';
-import { PluginStream, setChannel, setDisplay, setSystem, setVessel } from './stream';
+import { PluginStream, isDemo, setChannel, setDemo, setDisplay, setSystem, setVessel } from './stream';
 import { prefs, savePrefs, storedKeys, type Prefs, type ViewConfig } from './prefs';
 import { ICONS } from './icons';
 import {
@@ -11,7 +11,7 @@ import {
   type Ctx, type DialogHandle,
 } from './dialogs';
 import { formatDepth, formatTemp, snapToPreset, unitByCode, unitById, type DepthUnit } from '../../src/shared/units';
-import { isChannelName, type ChannelName, type DisplayPrefs, type VesselSettings, type WifishState } from '../../src/shared/api';
+import { isChannelName, type ChannelName, type DisplayPrefs, type LinkState, type VesselSettings, type WifishState } from '../../src/shared/api';
 
 declare const __VERSION__: string;
 
@@ -176,6 +176,7 @@ btnSettings.addEventListener('click', () => openSonarSettings('downvision', btnS
 
 btnMore.addEventListener('click', () => {
   overflowMenu(btnMore, [
+    ...(isDemo() ? [{ label: 'Leave demo', action: () => useDemo(false) }] : []),
     { label: 'Settings', action: () => mainSettings(ctx) },
     { label: 'Help', action: () => helpDialog() },
     { label: 'About', action: () => aboutDialog(state, __VERSION__) },
@@ -627,6 +628,11 @@ function paintConnection(): void {
     offlineTimer = undefined;
     $('offline').hidden = true;
   }
+  // The demo runs on the plugin: offered while the plugin runs, not on top of a demo source;
+  // a demo that went offline (plugin stopped) can be left from here.
+  const demoBtn = $('btn-demo');
+  demoBtn.textContent = isDemo() ? 'Leave demo' : 'Sonar demo';
+  demoBtn.hidden = !isDemo() && (!streamOk || !s || s.source === 'demo');
   $('offline-hint').textContent = !streamOk
     ? 'Cannot reach the Signal K server.'
     : !s ? 'The Wi-Fish plugin is not running. Enable it in the Signal K server’s plugin configuration.'
@@ -659,6 +665,42 @@ $('btn-retry').addEventListener('click', () => {
   $('offline').hidden = true;
   stream.open();
 });
+$('btn-demo').addEventListener('click', () => useDemo(!isDemo()));
+
+/** Real sonar link last reported to this page in demo mode; null = not known (yet). */
+let sonarLink: LinkState | null = null;
+let sonarDialog: DialogHandle | null = null;
+
+/**
+ * Show the plugin's demo sonar on this page, or the real sonar again: start over with the other
+ * stream (its own history, a new epoch). Not remembered, so a reload starts on the real sonar.
+ */
+function useDemo(on: boolean): void {
+  if (on === isDemo()) return;
+  setDemo(on);
+  sonarLink = null;
+  sonarDialog?.close();
+  closeAll();
+  resetHistory();
+  epoch = null;
+  backlogDone = false;
+  $('offline').hidden = true;
+  stream.open();
+}
+
+/** In demo mode: the real sonar came online, so offer to leave the demo (once per connection). */
+function onSonar(link: LinkState | null): void {
+  if (!isDemo()) return;
+  const was = sonarLink;
+  sonarLink = link;
+  if (link === 'connected' && was !== 'connected' && !sonarDialog) {
+    sonarDialog = messageBox('Sonar connected', 'The sonar is online. Leave the demo and show it?',
+      [{ label: 'Stay in demo' }, { label: 'Show sonar', action: () => useDemo(false) }],
+      { onClose: () => { sonarDialog = null; } });
+  } else if (link !== 'connected') {
+    sonarDialog?.close();
+  }
+}
 
 // Simulated-data label blinks every 2 s (app: sim_blink, msg 108).
 window.setInterval(() => {
@@ -803,6 +845,7 @@ const stream = new PluginStream({
     backlogDone = true;
     paintConnection();
   },
+  sonar: onSonar,
   /** Stream connected or dropped; after a drop the backlog is replayed again. */
   connection(ok) {
     streamOk = ok;

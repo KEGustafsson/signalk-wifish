@@ -65,7 +65,7 @@ the app is not limited to admin users.
 | Wi-Fi interface address | empty | explicit local IPv4 on the sonar Wi-Fi; until an interface has that address (the sonar is off, so its DHCP has given none) the plugin reports that it is waiting, not an error, and retries every 5 s. Empty = automatic: discovery listens on every `192.x` interface and the session joins every one of them on the announced sonar's subnet (all of them when none matches, e.g. a `/32` address), so overlapping subnets and the `/32` setup in [network setup](docs/network-setup.md) work without it |
 | Control the sonar | on | send keepalives and settings; off = passive listener |
 | Replay file | empty | **absolute** path of a capture made with `tools/wifish-probe.mjs --log`. With `replay` selected and no file, the plugin reports an error instead of silently running the demo |
-| Demo model | `dragonfly` | `dragonfly` (sonar + DownVision) or `wifish` (DownVision only) |
+| Demo model | `dragonfly` | `dragonfly` (sonar + DownVision) or `wifish` (DownVision only); also the web app's *Sonar demo* |
 | History columns per channel | 1500 | echogram history kept on the server |
 | Publish depth / water temperature | on | Signal K output |
 
@@ -76,7 +76,8 @@ depth.
 
 The `demo` source publishes **simulated** depth and water temperature into the Signal K
 data model exactly like a real unit would. On a boat, turn off *Publish depth / water
-temperature* while trying the demo, or don't use the demo there at all.
+temperature* while trying the demo, or don't use the demo there at all. The web app's
+*Sonar demo* button (below) is safe on a boat: it publishes nothing.
 
 ## Using the web app
 
@@ -93,6 +94,7 @@ The screen follows the Android app:
 | History scrollbar | shown while paused; keyboard-operable: Tab to it, then Arrow keys step back and forward, Page Up / Page Down move a screen, Home shows the oldest pings and End returns to live |
 | Press and hold | depth, bottom, water temperature and time at that point |
 | ⋯ → Settings | transducer depth, waterline to transducer, depth and temperature units, simulator |
+| Sonar offline → **Sonar demo** | shows a simulated sonar on this page only (labelled DEMO). It runs on the plugin, separate from the real sonar: nothing it shows is published to Signal K, and other viewers keep the real sonar. ⋯ → **Leave demo** returns to the sonar; when the sonar comes online meanwhile, the page offers to switch. Not remembered: a reload starts on the real sonar. |
 
 ![Sonar settings](docs/screenshot-settings.jpg)
 

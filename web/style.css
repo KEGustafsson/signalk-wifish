@@ -90,6 +90,7 @@ button { font: inherit; color: inherit; }
 .connect-btn { background: transparent; border: 2px solid #555557; color: #fff; padding: 9px 34px; border-radius: 24px; cursor: pointer; font-weight: 600; }
 .connect-btn:hover { border-color: #ffcc00; }
 .offline { animation: fade .3s; }
+.offline-buttons { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px; }
 @keyframes fade { from { opacity: 0; } }
 
 /* ---------------------------------------------------------------- dialogs */

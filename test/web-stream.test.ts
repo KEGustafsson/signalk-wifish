@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, afterEach, vi } from 'vitest';
-import { PluginStream, isColumn, isState, setChannel, setDisplay, type StreamHandlers, DROP_GRACE_MS, RECONNECT_MIN_MS, RECONNECT_MAX_MS } from '../web/src/stream';
+import { PluginStream, isColumn, isSonarLink, isState, setChannel, setDemo, setDisplay, setSystem, setVessel, type StreamHandlers, DROP_GRACE_MS, RECONNECT_MIN_MS, RECONNECT_MAX_MS } from '../web/src/stream';
 
 /** EventSource stub: records listeners, lets a test dispatch events and set readyState. */
 class FakeES {
@@ -34,6 +34,7 @@ function handlers(): StreamHandlers & { calls: string[] } {
     reset: () => calls.push('reset'),
     live: () => calls.push('live'),
     connection: (ok) => calls.push(`conn:${ok}`),
+    sonar: (link) => calls.push(`sonar:${link}`),
   };
 }
 
@@ -219,4 +220,42 @@ test('post: errors carry the server message, or the HTTP status when the body is
   await expect(setChannel('sonar', { gain: 500 })).rejects.toThrow('gain out of range');
   vi.stubGlobal('fetch', fakeFetch(502, '<html>Bad gateway</html>'));
   await expect(setChannel('sonar', { gain: 50 })).rejects.toThrow('HTTP 502');
+});
+
+test('demo mode: the stream and the sonar settings go to the demo engine, units and vessel do not', async () => {
+  const fetch = fakeFetch(200, state);
+  vi.stubGlobal('fetch', fetch);
+  try {
+    setDemo(true);
+    const h = handlers();
+    const st = new PluginStream(h);
+    st.open();
+    expect(FakeES.instances[0].url).toMatch(/\/api\/stream\?demo=1$/);
+    FakeES.instances[0].emit('sonar', JSON.stringify({ link: 'searching' }));
+    FakeES.instances[0].emit('sonar', JSON.stringify({ link: null }));
+    FakeES.instances[0].emit('sonar', JSON.stringify({ link: 3 })); // ignored
+    expect(h.calls).toEqual(['sonar:searching', 'sonar:null']);
+    await setChannel('downvision', { gain: 50 });
+    await setSystem({ simulator: true });
+    await setDisplay({ tempUnit: 'C' }).catch(() => {});
+    await setVessel({ surfaceToTransducerCm: 10 }).catch(() => {});
+    setDemo(false);
+    st.open(); // back to the real sonar
+    expect(FakeES.instances[1].url).toMatch(/\/api\/stream$/);
+    await setChannel('sonar', { gain: 50 });
+    const urls = fetch.mock.calls.map((c) => (c as unknown[])[0]);
+    expect(urls).toEqual([
+      '/plugins/signalk-wifish/api/channel/downvision?demo=1', '/plugins/signalk-wifish/api/system?demo=1',
+      '/plugins/signalk-wifish/api/display', '/plugins/signalk-wifish/api/vessel', '/plugins/signalk-wifish/api/channel/sonar',
+    ]);
+  } finally {
+    setDemo(false);
+  }
+});
+
+test('isSonarLink shape check', () => {
+  expect(isSonarLink({ link: 'connected' })).toBe(true);
+  expect(isSonarLink({ link: null })).toBe(true);
+  expect(isSonarLink({})).toBe(false);
+  expect(isSonarLink(null)).toBe(false);
 });

@@ -6,7 +6,7 @@ import type { AddressInfo } from 'node:net';
 import { EventEmitter } from 'node:events';
 import { plugin } from '../src/plugin';
 import {
-  Api, MAX_BACKLOG_BYTES, MAX_BODY_BYTES, MAX_STREAMS, MAX_UNREAD_BYTES, backlogFrames, parseChannelPatch, parseSystemPatch,
+  Api, DEMO_IDLE_MS, MAX_BACKLOG_BYTES, MAX_BODY_BYTES, MAX_STREAMS, MAX_UNREAD_BYTES, backlogFrames, parseChannelPatch, parseSystemPatch,
 } from '../src/api';
 import type { Engine, HistoryEntry } from '../src/engine';
 import type { Delta } from '../src/signalk';
@@ -247,6 +247,26 @@ describe('plugin lifecycle', () => {
       expect(() => p.stop()).not.toThrow();
     }
     expect(() => p.stop()).not.toThrow();
+  });
+
+  test('demo viewers get a demo sonar of their own that publishes nothing to Signal K', async () => {
+    // The configured source is offline, like a sonar that is switched off.
+    const { base, deltas, statuses } = await startPlugin({ source: 'replay', replayFile: '/nonexistent/capture.bin' });
+    const ctrl = new AbortController();
+    const res = await fetch(`${base}/api/stream?demo=1`, { signal: ctrl.signal });
+    const text = await readUntil(res.body!.getReader(), /event: col\n/);
+    ctrl.abort();
+    expect(text).toMatch(/event: state\ndata: \{[^\n]*"source":"demo"/);
+    expect(text).toContain('event: sonar\ndata: {"link":"offline"}');
+    const demo = await (await fetch(`${base}/api/state?demo=1`)).json();
+    expect(demo).toMatchObject({ source: 'demo', link: 'connected', canControl: true });
+    const r = await fetch(`${base}/api/channel/sonar?demo=1`, { method: 'POST', headers: json, body: JSON.stringify({ gain: 77, gainAuto: false }) });
+    expect((await r.json()).channels.sonar).toMatchObject({ gain: 77, gainAuto: false });
+    // The plugin's own engine is untouched: still the offline replay, settings refused.
+    expect(await (await fetch(`${base}/api/state`)).json()).toMatchObject({ source: 'replay', link: 'offline' });
+    expect((await fetch(`${base}/api/channel/sonar`, { method: 'POST', headers: json, body: '{"gain":50}' })).status).toBe(409);
+    expect(deltas).toEqual([]);
+    expect(statuses.every((m) => !/demo/i.test(m))).toBe(true);
   });
 
   test('API answers 503 while stopped', async () => {
@@ -555,6 +575,118 @@ describe('SSE streams', () => {
     api.bind();
     expect(r.events.slice(-2)).toEqual(['reset', 'state']);
     expect(r.chunks.at(-1)).toContain('"canControl":false');
+    api.close();
+  });
+});
+
+describe('demo engine', () => {
+  type DemoFake = FakeEngine & { start: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn> };
+  /** Engine stand-in with start/stop spies; `link` is its state's link. */
+  const engineWith = (link: string, o: Partial<Omit<FakeEngine, 'history'>> = {}): DemoFake =>
+    Object.assign(fakeEngine({ state: () => ({ link, canControl: true }) as never, ...o }), { start: vi.fn(), stop: vi.fn() });
+  const DEMO = { url: '/api/stream?demo=1' };
+
+  test('started for the first demo viewer, kept apart from the others, stopped DEMO_IDLE_MS after the last left', async () => {
+    vi.useFakeTimers();
+    const real = engineWith('searching');
+    const demos: DemoFake[] = [];
+    const api = new Api(() => real as never, undefined, undefined, { demo: () => { const e = engineWith('connected'); demos.push(e); return e as never; } });
+    api.bind();
+    const plain = new FakeRes();
+    await stream(api, plain);
+    expect(demos).toHaveLength(0); // nobody asked for the demo
+    const a = new FakeRes(), b = new FakeRes();
+    await stream(api, a, DEMO);
+    await stream(api, b, DEMO);
+    expect(demos).toHaveLength(1);
+    expect(demos[0].start).toHaveBeenCalledOnce();
+    expect(a.events.slice(0, 4)).toEqual(['display', 'state', 'vessel', 'sonar']);
+    expect(a.chunks.find((c) => c.startsWith('event: sonar'))).toBe('event: sonar\ndata: {"link":"searching"}\n\n');
+
+    // Each engine's columns and states reach only its own viewers; the real link reaches demo viewers.
+    emitCol(demos[0], col('sonar', 1, 1));
+    emitCol(real, col('sonar', 7, 1));
+    real.emit('state', { link: 'connected' });
+    real.emit('state', { link: 'connected', depthCm: 5 }); // same link: no second "sonar"
+    expect(a.cols.map((c) => c.n)).toEqual([1]);
+    expect(plain.cols.map((c) => c.n)).toEqual([7]);
+    expect(a.chunks.filter((c) => c.startsWith('event: sonar')).at(-1)).toBe('event: sonar\ndata: {"link":"connected"}\n\n');
+    expect(a.events.filter((e) => e === 'sonar')).toHaveLength(2);
+    expect(plain.events).not.toContain('sonar');
+
+    // Settings go to the engine the request names.
+    const setChannel = vi.fn(() => null);
+    Object.assign(demos[0], { setChannel });
+    const r = new FakeRes();
+    await api.handle(parsed({ gain: 10 }, { url: '/api/channel/sonar?demo=1' }) as never, r as never, '/api/channel/sonar');
+    expect(r.statusCode).toBe(200);
+    expect(setChannel).toHaveBeenCalledWith('sonar', { gain: 10 });
+
+    // Last demo viewer gone: the demo runs on for DEMO_IDLE_MS; a viewer back in time keeps it.
+    a.emit('close'); b.emit('close');
+    vi.advanceTimersByTime(DEMO_IDLE_MS - 1);
+    const c = new FakeRes();
+    await stream(api, c, DEMO);
+    vi.advanceTimersByTime(DEMO_IDLE_MS);
+    expect(demos).toHaveLength(1);
+    expect(demos[0].stop).not.toHaveBeenCalled();
+    c.emit('close');
+    vi.advanceTimersByTime(DEMO_IDLE_MS);
+    expect(demos[0].stop).toHaveBeenCalledOnce();
+    const s = new FakeRes();
+    await api.handle(req({ url: '/api/state?demo=1' }) as never, s as never, '/api/state');
+    expect(s.statusCode).toBe(503);
+    api.close();
+  });
+
+  test('runs only while the plugin does: stopped with it, started again for the demo viewers still there', async () => {
+    let real: DemoFake | null = engineWith('searching');
+    const demos: DemoFake[] = [];
+    const api = new Api(() => real as never, undefined, undefined, { demo: () => { const e = engineWith('connected'); demos.push(e); return e as never; } });
+    api.bind();
+    const a = new FakeRes();
+    await stream(api, a, DEMO);
+    await live(a);
+    real = null;
+    api.bind();
+    expect(demos[0].stop).toHaveBeenCalledOnce();
+    expect(a.chunks.slice(-2)).toEqual(['event: sonar\ndata: {"link":null}\n\n', 'event: state\ndata: null\n\n']);
+    // A viewer joining meanwhile gets no demo.
+    const b = new FakeRes();
+    await stream(api, b, DEMO);
+    expect(b.chunks.find((c) => c.startsWith('event: state'))).toBe('event: state\ndata: null\n\n');
+    expect(demos).toHaveLength(1);
+    real = engineWith('searching');
+    api.bind();
+    expect(demos).toHaveLength(2);
+    expect(demos[1].start).toHaveBeenCalledOnce();
+    expect(a.events.slice(-3)).toEqual(['sonar', 'reset', 'state']);
+    expect(a.chunks.at(-1)).toContain('"link":"connected"');
+    api.close();
+    expect(demos[1].stop).toHaveBeenCalledOnce();
+  });
+
+  test('without a demo factory demo viewers get state null and demo settings 503', async () => {
+    const api = new Api(() => fakeEngine() as never);
+    api.bind();
+    const a = new FakeRes();
+    await stream(api, a, DEMO);
+    expect(a.chunks.find((c) => c.startsWith('event: state'))).toBe('event: state\ndata: null\n\n');
+    const r = new FakeRes();
+    await api.handle(parsed({ gain: 10 }, { url: '/api/channel/sonar?demo=1' }) as never, r as never, '/api/channel/sonar');
+    expect(r.statusCode).toBe(503);
+    expect(r.json).toEqual({ error: 'demo not running' });
+    api.close();
+  });
+
+  test('a demo whose factory throws is logged, not thrown', async () => {
+    const error = vi.fn();
+    const api = new Api(() => fakeEngine() as never, undefined, undefined, { error, demo: () => { throw new Error('nope'); } });
+    api.bind();
+    const a = new FakeRes();
+    await stream(api, a, DEMO);
+    expect(error).toHaveBeenCalledWith('demo: nope');
+    expect(a.statusCode).toBe(200);
     api.close();
   });
 });
