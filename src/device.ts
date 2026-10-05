@@ -200,6 +200,22 @@ export class DeviceTransport extends EventEmitter<TransportEvents> implements Tr
     this.#close();
     this.#report('socket', why);
     this.#setLink('offline', why);
+    this.#retryLater();
+  }
+
+  /**
+   * No interface to listen on yet: the sonar is switched off, so its DHCP has not given this
+   * machine an address on its Wi-Fi, or the Wi-Fi is not joined. That is a normal state, not
+   * an error: report 'searching' with `why` and look again every RETRY_MS.
+   */
+  #waitForInterface(why: string): void {
+    if (this.#link !== 'searching' || this.#message !== why) this.#log(why);
+    this.#setLink('searching', why);
+    this.#retryLater();
+  }
+
+  /** Reopen after RETRY_MS while running, unless a reopen is already pending. */
+  #retryLater(): void {
     if (!this.#running || this.#retry) return;
     this.#retry = setTimeout(() => this.#safely('retry', () => { this.#retry = null; if (this.#running) this.#open(); }), TIMING.RETRY_MS);
   }
@@ -213,9 +229,9 @@ export class DeviceTransport extends EventEmitter<TransportEvents> implements Tr
     const { iface } = this.#opts;
     this.#candidates = candidatesFrom(os.networkInterfaces(), iface);
     if (!this.#candidates.length) {
-      return this.#scheduleRetry(iface
-        ? `Wi-Fi interface address ${iface} is not on this machine; join the sonar Wi-Fi or correct the setting`
-        : 'No IPv4 network interface; join the sonar Wi-Fi');
+      return this.#waitForInterface(iface
+        ? `Waiting for Wi-Fi interface address ${iface}: the sonar is off or this machine has not joined its Wi-Fi`
+        : 'Waiting for a network interface: the sonar is off or this machine has not joined its Wi-Fi');
     }
     const disc = dgram.createSocket({ type: 'udp4', reuseAddr: true });
     this.#disc = disc;

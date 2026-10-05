@@ -29,8 +29,11 @@
 - Sonar data from any address other than the locked-on sonar's kept a dead session alive
   (a second unit in range, or the same unit back on a new address) while keepalives and
   settings went to the old one. Only the sonar's own data counts now.
-- A configured Wi-Fi interface address that does not exist is a plugin error, retried
-  every 5 s, instead of a silent "Looking for" that never recovered.
+- A configured Wi-Fi interface address that is not up (the sonar is switched off, so its
+  DHCP has given this machine no address on its Wi-Fi), or no interface at all, is no
+  longer a plugin error: the status reads "Waiting for Wi-Fi interface address …" and the
+  interfaces are re-read every 5 s until it appears, instead of a silent "Looking for"
+  that never recovered.
 - A sonar that went away shows "Sonar offline. Looking for…" instead of the message for
   one never found.
 - A unit that rebooted within 20 s (lower settings sequence numbers) was ignored until

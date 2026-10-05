@@ -72,7 +72,7 @@ export const schema = {
     iface: {
       type: 'string',
       title: 'Wi-Fi interface address',
-      description: 'Local IPv4 address on the sonar Wi-Fi. Empty = pick the 192.x address on the sonar subnet, like the app.',
+      description: 'Local IPv4 address on the sonar Wi-Fi. Empty = pick the 192.x address on the sonar subnet, like the app. While the address is not up (sonar off), the plugin waits for it.',
       default: '',
     },
     keepalive: {
