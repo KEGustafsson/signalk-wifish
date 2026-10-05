@@ -393,8 +393,11 @@ suggestion, or something was deliberately left:
   worth confirming once on hardware that sonar data arrives from the announced device IP;
   the protocol and the announcement check say it does.
 - **5.1 lost sonar**: the "Sonar offline" status is kept, as a status. A sonar that is
-  switched off is normal on a moored boat, so it is not made a plugin error; only a
-  missing network interface or interface address is.
+  switched off is normal on a moored boat, so it is not made a plugin error. Neither is a
+  missing network interface or configured interface address (follow-up): with the sonar
+  off its DHCP gives this machine no address on its Wi-Fi, so the status says "Waiting
+  for …" (after a lost sonar "Sonar offline. Waiting for …") and the interfaces are
+  re-read every 5 s until the address appears.
 - **5.1 quick reboot**: handled without a full session reset. After a lost link the next
   broadcast of each setting is accepted whatever its seq, so the readout keeps the old
   settings until the new ones arrive instead of blanking.

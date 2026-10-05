@@ -62,7 +62,7 @@ the app is not limited to admin users.
 | Option | Default | |
 |---|---|---|
 | Data source | `device` | `device` = the sonar on the joined Wi-Fi, `demo` = built-in simulated sonar, `replay` = a raw capture file |
-| Wi-Fi interface address | empty | explicit local IPv4 on the sonar Wi-Fi; until an interface has that address the plugin reports an error and retries every 5 s. Empty = automatic: discovery listens on every `192.x` interface and the session joins every one of them on the announced sonar's subnet (all of them when none matches, e.g. a `/32` address), so overlapping subnets and the `/32` setup in [network setup](docs/network-setup.md) work without it |
+| Wi-Fi interface address | empty | explicit local IPv4 on the sonar Wi-Fi; until an interface has that address (the sonar is off, so its DHCP has given none) the plugin reports that it is waiting, not an error, and retries every 5 s. Empty = automatic: discovery listens on every `192.x` interface and the session joins every one of them on the announced sonar's subnet (all of them when none matches, e.g. a `/32` address), so overlapping subnets and the `/32` setup in [network setup](docs/network-setup.md) work without it |
 | Control the sonar | on | send keepalives and settings; off = passive listener |
 | Replay file | empty | **absolute** path of a capture made with `tools/wifish-probe.mjs --log`. With `replay` selected and no file, the plugin reports an error instead of silently running the demo |
 | Demo model | `dragonfly` | `dragonfly` (sonar + DownVision) or `wifish` (DownVision only) |

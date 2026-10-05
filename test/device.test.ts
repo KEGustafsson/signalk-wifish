@@ -259,30 +259,63 @@ describe('DeviceTransport on loopback', () => {
     expect(handles()).toBe(udpBefore);
   });
 
-  test('no interface: offline with the reason, retried until one appears', async () => {
+  test('sonar switched off and its Wi-Fi address gone with it: "Sonar offline. Waiting for …" until it is back', async () => {
+    const sonar = await bound('127.0.0.1');
+    open.push(sonar);
+    const port = await freePort();
+    const group = '239.255.0.8';
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'performance'] });
+    const { t, links, states, errors } = make({ discovery: { group, port }, keepalive: false });
+    t.start();
+    await waitFor(() => links.find(([s]) => s === 'searching'));
+    await send(sonar, announceMsg(group, port, '127.0.0.1', 1), port);
+    await send(sonar, unitMsg(), port);
+    await send(sonar, bottomMsg(100), port);
+    await waitFor(() => (states().at(-1) === 'connected' ? true : undefined));
+    // The sonar is switched off: no more data, and its DHCP lease on this machine goes too.
+    const ifaces = vi.spyOn(os, 'networkInterfaces').mockReturnValue({ eth0: [ni('10.0.0.5', '255.255.255.0')] });
+    vi.advanceTimersByTime(TIMING.GIVE_UP_MS + 1000);
+    const waiting = 'Sonar offline. Waiting for Wi-Fi interface address 127.0.0.1: the sonar is off or this machine has not joined its Wi-Fi';
+    expect(links.at(-1)).toEqual(['searching', waiting]);
+    vi.advanceTimersByTime(2 * TIMING.RETRY_MS);
+    expect(links.at(-1)).toEqual(['searching', waiting]); // kept across retries
+    ifaces.mockRestore(); // switched on again: the address is back
+    vi.advanceTimersByTime(TIMING.RETRY_MS);
+    await waitFor(() => (links.at(-1)![1] === 'Sonar offline. Looking for a Wi-Fish / Dragonfly' ? true : undefined));
+    expect(links.some(([s]) => s === 'offline')).toBe(false);
+    expect(errors).toEqual([]);
+  });
+
+  test('no interface: waiting (not an error), retried until one appears', async () => {
     const port = await freePort();
     const ifaces = vi.spyOn(os, 'networkInterfaces').mockReturnValue({ lo: [ni('127.0.0.1', '255.0.0.0', true)] });
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
-    const { t, links } = make({ discovery: { group: '239.255.0.5', port }, iface: '' });
+    const { t, links, errors } = make({ discovery: { group: '239.255.0.5', port }, iface: '' });
     t.start();
-    expect(links).toEqual([['offline', 'No IPv4 network interface; join the sonar Wi-Fi']]);
+    expect(links).toEqual([['searching', 'Waiting for a network interface: the sonar is off or this machine has not joined its Wi-Fi']]);
     vi.advanceTimersByTime(TIMING.RETRY_MS);
     expect(links).toHaveLength(1); // still none: retried quietly
     ifaces.mockReturnValue(ifacesWith('192.0.2.77')); // the Wi-Fi comes up (a join on it fails here: listening anyway)
     vi.advanceTimersByTime(TIMING.RETRY_MS);
-    await waitFor(() => links.find(([s]) => s === 'searching'));
+    await waitFor(() => links.find(([, m]) => m === 'Looking for a Wi-Fish / Dragonfly'));
+    expect(links.some(([s]) => s === 'offline')).toBe(false);
+    expect(errors.filter((e) => !/could not join/.test(e))).toEqual([]);
   });
 
-  test('a configured interface address that is not up is an error until it appears', async () => {
+  test('a configured interface address that is not up (sonar off, no DHCP lease) is waited for, not an error', async () => {
     const port = await freePort();
     const ifaces = vi.spyOn(os, 'networkInterfaces').mockReturnValue(ifacesWith('10.0.0.5'));
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
-    const { t, links } = make({ discovery: { group: '239.255.0.6', port }, iface: '192.168.0.141' });
+    const { t, links, errors } = make({ discovery: { group: '239.255.0.6', port }, iface: '192.168.0.141' });
     t.start();
-    expect(links).toEqual([['offline', 'Wi-Fi interface address 192.168.0.141 is not on this machine; join the sonar Wi-Fi or correct the setting']]);
-    ifaces.mockReturnValue(ifacesWith('10.0.0.5', '192.168.0.141'));
+    expect(links).toEqual([['searching', 'Waiting for Wi-Fi interface address 192.168.0.141: the sonar is off or this machine has not joined its Wi-Fi']]);
+    vi.advanceTimersByTime(3 * TIMING.RETRY_MS);
+    expect(links).toHaveLength(1); // still waiting, quietly
+    expect(errors).toEqual([]);
+    ifaces.mockReturnValue(ifacesWith('10.0.0.5', '192.168.0.141')); // the sonar is switched on and its DHCP hands out the address
     vi.advanceTimersByTime(TIMING.RETRY_MS);
-    await waitFor(() => links.find(([s]) => s === 'searching'));
+    await waitFor(() => links.find(([, m]) => m === 'Looking for a Wi-Fish / Dragonfly'));
+    expect(links.some(([s]) => s === 'offline')).toBe(false);
   });
 
   // Windows lets a SO_REUSEADDR socket take over a port another socket holds, so the bind does not fail there.
