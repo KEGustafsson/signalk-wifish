@@ -55,7 +55,7 @@
   "devDependencies": {
     "@types/node": "^20.19.43",
     "esbuild": "^0.28.2",
-    "typescript": "~5.9.0",
+    "typescript": "~7.0.2",
     "vitest": "^4.1.11"
   },
   "repository": {
