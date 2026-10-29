@@ -76,7 +76,7 @@ jobs:
   # ── Automatic runs (push / pull request) ──────────────────
   test-plugin-auto:
     if: ${{ github.event_name != 'workflow_dispatch' }}
-    uses: SignalK/signalk-server/.github/workflows/plugin-ci.yml@f5e91aa74817ca14bbff6b4ae47f8c83f3fe0b36 # master, 2026-09-30
+    uses: SignalK/signalk-server/.github/workflows/plugin-ci.yml@0c8c59f6f948a67ca0df3e6a11bc7ae89a374543 # master, 2026-09-30
     with:
       test-command: npm test
       build-command: npm run build --if-present
@@ -87,7 +87,7 @@ jobs:
   # ── Manual runs (workflow_dispatch with custom inputs) ────
   test-plugin-manual:
     if: ${{ github.event_name == 'workflow_dispatch' }}
-    uses: SignalK/signalk-server/.github/workflows/plugin-ci.yml@f5e91aa74817ca14bbff6b4ae47f8c83f3fe0b36 # master, 2026-09-30
+    uses: SignalK/signalk-server/.github/workflows/plugin-ci.yml@0c8c59f6f948a67ca0df3e6a11bc7ae89a374543 # master, 2026-09-30
     with:
       test-command: ${{ inputs.test-command }}
       build-command: ${{ inputs.build-command }}
